@@ -11,7 +11,7 @@ use winit::{
     event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{CursorGrabMode, Window, WindowId},
+    window::{CursorGrabMode, Fullscreen, Window, WindowId},
 };
 
 use chat::{Chat, MessageKind, commands};
@@ -143,7 +143,9 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let window_attributes = Window::default_attributes().with_title("minecraft-but-optimized");
+        let window_attributes = Window::default_attributes()
+            .with_title("minecraft-but-optimized")
+            .with_fullscreen(Some(Fullscreen::Borderless(None)));
         let window = Arc::new(
             event_loop
                 .create_window(window_attributes)
