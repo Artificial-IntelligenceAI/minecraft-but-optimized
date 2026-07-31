@@ -12,8 +12,13 @@ codegen-units = 1
 panic = "abort"
 
 [dependencies]
+bevy_ecs = "0.19.0"
+bytemuck = { version = "1.25.2", features = ["derive"] }
 env_logger = "0.11.11"
+glam = "0.32.1"
 log = "0.4.33"
+noise = "0.9.0"
 pollster = "1.0.1"
+rayon = "1.12.0"
 wgpu = "30.0.0"
 winit = "0.30.13"

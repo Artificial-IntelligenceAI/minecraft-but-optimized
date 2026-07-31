@@ -1,153 +1,83 @@
-use std::sync::Arc;
+mod render;
+mod world;
 
+use std::sync::Arc;
+use std::time::Instant;
+
+use glam::Vec3;
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    window::{Window, WindowId},
+    keyboard::{KeyCode, PhysicalKey},
+    window::{CursorGrabMode, Window, WindowId},
 };
 
-enum RenderOutcome {
-    Ok,
-    Skip,
-    Reconfigure,
-    Fatal,
+use render::{
+    RenderOutcome, Renderer,
+    camera::{Camera, FlyCameraController},
+};
+use world::{generation, meshing};
+
+/// Render distance in chunks (radius), in x/z, around the origin.
+const WORLD_RADIUS_CHUNKS: i32 = 4;
+const WORLD_SEED: u32 = 1;
+
+struct AppState {
+    renderer: Renderer,
+    camera: Camera,
+    controller: FlyCameraController,
+    last_frame: Instant,
 }
 
-struct GraphicsState {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    window: Arc<Window>,
-}
-
-impl GraphicsState {
+impl AppState {
     async fn new(window: Arc<Window>) -> Self {
-        let size = window.inner_size();
+        let renderer = Renderer::new(window).await;
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("failed to create surface");
+        log::info!("generating world (radius {WORLD_RADIUS_CHUNKS} chunks)...");
+        let gen_start = Instant::now();
+        let world = generation::generate_world(WORLD_RADIUS_CHUNKS, WORLD_SEED);
+        log::info!("world generated in {:?}", gen_start.elapsed());
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                ..Default::default()
-            })
-            .await
-            .expect("failed to find a suitable GPU adapter");
+        let mesh_start = Instant::now();
+        let meshes = meshing::mesh_world(&world);
+        log::info!(
+            "meshed {} chunks in {:?}",
+            meshes.len(),
+            mesh_start.elapsed()
+        );
 
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("device"),
-                ..Default::default()
-            })
-            .await
-            .expect("failed to request device");
+        let mut renderer = renderer;
+        renderer.set_chunk_meshes(meshes);
 
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
-
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
+        let camera = Camera::new(Vec3::new(0.0, 110.0, 0.0), renderer.aspect_ratio());
 
         Self {
-            surface,
-            device,
-            queue,
-            config,
-            window,
+            renderer,
+            camera,
+            controller: FlyCameraController::default(),
+            last_frame: Instant::now(),
         }
     }
 
-    fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
+    fn set_cursor_grabbed(&mut self, grabbed: bool) {
+        let window = &self.renderer.window;
+        if grabbed {
+            let locked = window.set_cursor_grab(CursorGrabMode::Locked).is_ok();
+            if !locked {
+                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+            }
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
         }
-        self.config.width = width;
-        self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
-    }
-
-    fn render(&mut self) -> RenderOutcome {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Still presentable this frame; reconfigure before the next one.
-                self.surface.configure(&self.device, &self.config);
-                frame
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return RenderOutcome::Skip;
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                return RenderOutcome::Reconfigure;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => return RenderOutcome::Fatal,
-        };
-
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("render encoder"),
-            });
-
-        {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        self.queue.present(frame);
-
-        RenderOutcome::Ok
+        window.set_cursor_visible(!grabbed);
+        self.controller.cursor_grabbed = grabbed;
     }
 }
 
 #[derive(Default)]
 struct App {
-    state: Option<GraphicsState>,
+    state: Option<AppState>,
 }
 
 impl ApplicationHandler for App {
@@ -163,34 +93,90 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        self.state = Some(pollster::block_on(GraphicsState::new(window)));
+        self.state = Some(pollster::block_on(AppState::new(window)));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(state) = &mut self.state else {
             return;
         };
-        if state.window.id() != id {
+        if state.renderer.window.id() != id {
             return;
         }
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.resize(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                state.renderer.resize(size.width, size.height);
+                state.camera.aspect = state.renderer.aspect_ratio();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if !state.controller.cursor_grabbed {
+                    state.set_cursor_grabbed(true);
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
+                if let PhysicalKey::Code(code) = key_event.physical_key {
+                    if code == KeyCode::Escape && key_event.state == ElementState::Pressed {
+                        state.set_cursor_grabbed(false);
+                    } else {
+                        state
+                            .controller
+                            .key_changed(code, key_event.state == ElementState::Pressed);
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
-                match state.render() {
+                let now = Instant::now();
+                let dt = (now - state.last_frame).as_secs_f32();
+                state.last_frame = now;
+
+                state.controller.update(&mut state.camera, dt);
+
+                match state.renderer.render(&state.camera) {
                     RenderOutcome::Ok | RenderOutcome::Skip => {}
                     RenderOutcome::Reconfigure => {
-                        state.resize(state.config.width, state.config.height);
+                        let (w, h) = (
+                            state.renderer.window.inner_size().width,
+                            state.renderer.window.inner_size().height,
+                        );
+                        state.renderer.resize(w, h);
                     }
                     RenderOutcome::Fatal => {
                         log::error!("fatal surface validation error");
                         event_loop.exit();
                     }
                 }
-                state.window.request_redraw();
             }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            state
+                .controller
+                .apply_mouse_delta(&mut state.camera, dx, dy);
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = &self.state {
+            state.renderer.window.request_redraw();
         }
     }
 }
