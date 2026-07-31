@@ -122,6 +122,7 @@ pub fn mesh_chunk(world: &World, chunk_pos: ChunkPos) -> ChunkMesh {
                     emit_quad(
                         &mut vertices,
                         &mut indices,
+                        origin,
                         d,
                         u,
                         v,
@@ -162,6 +163,7 @@ pub fn mesh_world(world: &World) -> Vec<(ChunkPos, ChunkMesh)> {
 fn emit_quad(
     vertices: &mut Vec<ChunkVertex>,
     indices: &mut Vec<u32>,
+    origin: IVec3,
     d: usize,
     u: usize,
     v: usize,
@@ -172,12 +174,17 @@ fn emit_quad(
     h: i32,
     entry: MaskEntry,
 ) {
+    let origin = [origin.x, origin.y, origin.z];
     let corner = |along_u: i32, along_v: i32| -> [f32; 3] {
         let mut p = [0i32; 3];
         p[d] = plane;
         p[u] = i + along_u;
         p[v] = j + along_v;
-        [p[0] as f32, p[1] as f32, p[2] as f32]
+        [
+            (p[0] + origin[0]) as f32,
+            (p[1] + origin[1]) as f32,
+            (p[2] + origin[2]) as f32,
+        ]
     };
 
     let c00 = corner(0, 0);
