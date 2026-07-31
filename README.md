@@ -10,20 +10,25 @@ This is not aiming for feature parity with Minecraft; it's a playground for buil
 
 ## Status
 
-Early scaffolding. Nothing playable yet.
+A flyable, streamed voxel world with a chat console. No survival gameplay yet (no collision, inventory, or block breaking/placing).
+
+- Fly around with **WASD** + mouse look (click the window to grab the cursor, **Escape** to release)
+- Terrain streams in/out around you as you move, instead of loading a fixed area once
+- Press **T** or **/** to open chat, like Minecraft — **Enter** to send, **Escape** to cancel, **↑/↓** to recall previous messages, **Page Up/Down** to scroll history
+- Chat commands: `/settings rd <chunks>` changes render distance live, `/help` lists commands
 
 ## Tech stack
 
 - **Language:** Rust
 - **Rendering:** [`wgpu`](https://wgpu.rs/) (Vulkan/Metal/DX12/GL backend)
 - **Windowing/input:** [`winit`](https://github.com/rust-windowing/winit)
-
-(Stack will grow as the project does — chunk data structures, meshing, world generation, etc. are still being designed.)
+- **Text rendering:** [`glyphon`](https://github.com/grovesNL/glyphon) (cosmic-text + wgpu)
+- **World generation:** [`noise`](https://github.com/Razaekel/noise-rs) (Perlin/Fbm heightmaps), parallelized with [`rayon`](https://github.com/rayon-rs/rayon)
 
 ## Building
 
 ```bash
-cargo run
+cargo run --release
 ```
 
 ## License

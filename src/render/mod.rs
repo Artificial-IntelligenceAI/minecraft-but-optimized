@@ -1,4 +1,7 @@
 pub mod camera;
+mod chat_view;
+mod quad;
+mod text;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -6,9 +9,12 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use crate::chat::Chat;
 use crate::world::ChunkPos;
 use crate::world::meshing::{ChunkMesh, ChunkVertex};
 use camera::CameraUniform;
+use quad::QuadRenderer;
+use text::UiText;
 
 pub enum RenderOutcome {
     Ok,
@@ -35,6 +41,8 @@ pub struct Renderer {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_meshes: HashMap<ChunkPos, GpuChunkMesh>,
+    quad_renderer: QuadRenderer,
+    ui_text: UiText,
     pub window: Arc<Window>,
 }
 
@@ -193,6 +201,9 @@ impl Renderer {
             cache: None,
         });
 
+        let quad_renderer = QuadRenderer::new(&device, config.format);
+        let ui_text = UiText::new(&device, &queue, config.format);
+
         Self {
             surface,
             device,
@@ -203,6 +214,8 @@ impl Renderer {
             camera_buffer,
             camera_bind_group,
             chunk_meshes: HashMap::new(),
+            quad_renderer,
+            ui_text,
             window,
         }
     }
@@ -257,7 +270,7 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, camera: &camera::Camera) -> RenderOutcome {
+    pub fn render(&mut self, camera: &camera::Camera, chat: &Chat) -> RenderOutcome {
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -329,6 +342,44 @@ impl Renderer {
                 render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
         }
+
+        let draw_data = chat_view::build(chat, self.config.width as f32, self.config.height as f32);
+        self.ui_text.prepare(
+            &self.device,
+            &self.queue,
+            self.config.width,
+            self.config.height,
+            &draw_data.text_lines,
+        );
+
+        {
+            let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui overlay pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            self.quad_renderer.draw(
+                &self.device,
+                &mut ui_pass,
+                self.config.width as f32,
+                self.config.height as f32,
+                &draw_data.quads,
+            );
+            self.ui_text.render(&mut ui_pass);
+        }
+        self.ui_text.trim();
 
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);

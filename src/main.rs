@@ -1,3 +1,4 @@
+mod chat;
 mod render;
 mod world;
 
@@ -13,6 +14,7 @@ use winit::{
     window::{CursorGrabMode, Window, WindowId},
 };
 
+use chat::{Chat, MessageKind, commands};
 use render::{
     RenderOutcome, Renderer,
     camera::{Camera, FlyCameraController},
@@ -36,6 +38,10 @@ struct AppState {
     streamer: ChunkStreamer,
     camera: Camera,
     controller: FlyCameraController,
+    chat: Chat,
+    /// Whether the cursor was grabbed right before chat was opened, so
+    /// closing chat can restore it instead of always re-grabbing.
+    pre_chat_grabbed: bool,
     last_frame: Instant,
 }
 
@@ -57,12 +63,20 @@ impl AppState {
             prime_start.elapsed()
         );
 
+        let mut chat = Chat::new();
+        chat.push_message(
+            "Welcome! Press T or / to chat. Try /settings rd <chunks>.",
+            MessageKind::CommandOk,
+        );
+
         Self {
             renderer,
             world,
             streamer,
             camera,
             controller: FlyCameraController::default(),
+            chat,
+            pre_chat_grabbed: false,
             last_frame: Instant::now(),
         }
     }
@@ -79,6 +93,33 @@ impl AppState {
         }
         window.set_cursor_visible(!grabbed);
         self.controller.cursor_grabbed = grabbed;
+    }
+
+    fn open_chat(&mut self, prefill: &str) {
+        self.pre_chat_grabbed = self.controller.cursor_grabbed;
+        self.set_cursor_grabbed(false);
+        self.chat.open(prefill);
+    }
+
+    fn close_chat(&mut self) {
+        self.chat.close();
+        if self.pre_chat_grabbed {
+            self.set_cursor_grabbed(true);
+        }
+    }
+
+    /// Handles a submitted chat line: runs it as a command if it starts with
+    /// `/` (echoing the command itself, then its response), otherwise logs it
+    /// as a plain chat message (there's no multiplayer to send it to).
+    fn handle_submitted_line(&mut self, line: String) {
+        if let Some(command) = line.strip_prefix('/') {
+            self.chat
+                .push_message(format!("/{command}"), MessageKind::CommandEcho);
+            let response = commands::execute(command, &mut self.streamer);
+            self.chat.push_message(response.text, response.kind);
+        } else {
+            self.chat.push_message(line, MessageKind::Chat);
+        }
     }
 }
 
@@ -131,20 +172,57 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                if !state.controller.cursor_grabbed {
+                if !state.chat.is_open && !state.controller.cursor_grabbed {
                     state.set_cursor_grabbed(true);
                 }
             }
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } => {
+                let pressed = key_event.state == ElementState::Pressed;
+
+                if state.chat.is_open {
+                    if pressed {
+                        match key_event.physical_key {
+                            PhysicalKey::Code(KeyCode::Escape) => state.close_chat(),
+                            PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
+                                // `submit()` always closes the chat itself (even on blank
+                                // input); route through `close_chat()` too so the
+                                // pre-chat cursor grab gets restored either way.
+                                if let Some(line) = state.chat.submit() {
+                                    state.handle_submitted_line(line);
+                                }
+                                state.close_chat();
+                            }
+                            PhysicalKey::Code(KeyCode::Backspace) => state.chat.backspace(),
+                            PhysicalKey::Code(KeyCode::ArrowUp) => state.chat.history_prev(),
+                            PhysicalKey::Code(KeyCode::ArrowDown) => state.chat.history_next(),
+                            PhysicalKey::Code(KeyCode::PageUp) => state.chat.scroll_up(),
+                            PhysicalKey::Code(KeyCode::PageDown) => state.chat.scroll_down(),
+                            _ => {
+                                if let Some(text) = key_event.text.as_ref() {
+                                    for c in text.chars().filter(|c| !c.is_control()) {
+                                        state.chat.push_char(c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 if let PhysicalKey::Code(code) = key_event.physical_key {
-                    if code == KeyCode::Escape && key_event.state == ElementState::Pressed {
-                        state.set_cursor_grabbed(false);
+                    if pressed {
+                        match code {
+                            KeyCode::KeyT | KeyCode::Enter | KeyCode::NumpadEnter => {
+                                state.open_chat("");
+                            }
+                            KeyCode::Slash => state.open_chat("/"),
+                            KeyCode::Escape => state.set_cursor_grabbed(false),
+                            _ => state.controller.key_changed(code, true),
+                        }
                     } else {
-                        state
-                            .controller
-                            .key_changed(code, key_event.state == ElementState::Pressed);
+                        state.controller.key_changed(code, false);
                     }
                 }
             }
@@ -153,7 +231,9 @@ impl ApplicationHandler for App {
                 let dt = (now - state.last_frame).as_secs_f32();
                 state.last_frame = now;
 
-                state.controller.update(&mut state.camera, dt);
+                if !state.chat.is_open {
+                    state.controller.update(&mut state.camera, dt);
+                }
 
                 let update = state.streamer.update(
                     &mut state.world,
@@ -162,7 +242,7 @@ impl ApplicationHandler for App {
                 );
                 apply_streaming_update(&mut state.renderer, update);
 
-                match state.renderer.render(&state.camera) {
+                match state.renderer.render(&state.camera, &state.chat) {
                     RenderOutcome::Ok | RenderOutcome::Skip => {}
                     RenderOutcome::Reconfigure => {
                         let (w, h) = (

@@ -44,6 +44,22 @@ impl ChunkStreamer {
         }
     }
 
+    pub fn load_radius(&self) -> i32 {
+        self.load_radius
+    }
+
+    /// Changes the load radius at runtime (e.g. from a `/settings rd` chat
+    /// command), keeping the existing gap between load and unload radii so
+    /// hysteresis still holds. Columns aren't force-reloaded immediately —
+    /// the next `update()` calls converge on the new radius at the normal
+    /// per-frame budget, so a smaller radius unloads gradually and a larger
+    /// one streams in gradually rather than both stalling a frame.
+    pub fn set_load_radius(&mut self, load_radius: i32) {
+        let gap = (self.unload_radius - self.load_radius).max(1);
+        self.load_radius = load_radius;
+        self.unload_radius = load_radius + gap;
+    }
+
     /// Loads/unloads columns around `focus` (typically the camera position),
     /// generating and remeshing at most `load_budget` new columns this call
     /// (pass `usize::MAX` to load everything needed in one go, e.g. at startup).
