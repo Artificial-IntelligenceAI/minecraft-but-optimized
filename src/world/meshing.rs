@@ -1,6 +1,5 @@
 use bytemuck::{Pod, Zeroable};
 use glam::IVec3;
-use rayon::prelude::*;
 
 use super::block::{self, BlockId};
 use super::chunk::CHUNK_SIZE_I32;
@@ -148,15 +147,6 @@ pub fn mesh_chunk(world: &World, chunk_pos: ChunkPos) -> ChunkMesh {
     }
 
     ChunkMesh { vertices, indices }
-}
-
-pub fn mesh_world(world: &World) -> Vec<(ChunkPos, ChunkMesh)> {
-    let positions: Vec<ChunkPos> = world.loaded_chunk_positions().collect();
-    positions
-        .par_iter()
-        .map(|&pos| (pos, mesh_chunk(world, pos)))
-        .filter(|(_, mesh)| !mesh.is_empty())
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

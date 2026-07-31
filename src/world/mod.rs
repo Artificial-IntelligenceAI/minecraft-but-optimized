@@ -2,6 +2,7 @@ pub mod block;
 pub mod chunk;
 pub mod generation;
 pub mod meshing;
+pub mod streaming;
 
 use std::collections::HashMap;
 
@@ -42,12 +43,12 @@ impl World {
         self.chunks.insert(pos, chunk);
     }
 
-    pub fn chunk(&self, pos: ChunkPos) -> Option<&Chunk> {
-        self.chunks.get(&pos)
+    pub fn remove_chunk(&mut self, pos: ChunkPos) {
+        self.chunks.remove(&pos);
     }
 
-    pub fn loaded_chunk_positions(&self) -> impl Iterator<Item = ChunkPos> + '_ {
-        self.chunks.keys().copied()
+    pub fn chunk(&self, pos: ChunkPos) -> Option<&Chunk> {
+        self.chunks.get(&pos)
     }
 
     pub fn get_block(&self, world_pos: IVec3) -> block::BlockId {

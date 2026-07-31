@@ -1,9 +1,8 @@
 use noise::{Fbm, NoiseFn, Perlin};
-use rayon::prelude::*;
 
 use super::block::{AIR, DIRT, GRASS, SAND, STONE};
 use super::chunk::{CHUNK_SIZE, Chunk, VOLUME, voxel_index};
-use super::{ChunkPos, World, chunk_origin};
+use super::{ChunkPos, chunk_origin};
 
 const SEA_LEVEL: i32 = 62;
 const BASE_HEIGHT: f64 = 68.0;
@@ -11,8 +10,9 @@ const AMPLITUDE: f64 = 28.0;
 const NOISE_FREQUENCY: f64 = 0.008;
 
 /// Chunks span world y in `[0, VERTICAL_CHUNKS * CHUNK_SIZE)`, which comfortably
-/// covers the height range produced by `BASE_HEIGHT`/`AMPLITUDE` above.
-const VERTICAL_CHUNKS: i32 = 4;
+/// covers the height range produced by `BASE_HEIGHT`/`AMPLITUDE` above. Loaded
+/// and unloaded per-column (all `VERTICAL_CHUNKS` chunks at once) by chunk streaming.
+pub const VERTICAL_CHUNKS: i32 = 4;
 
 pub struct TerrainGenerator {
     noise: Fbm<Perlin>,
@@ -62,30 +62,4 @@ impl TerrainGenerator {
 
         Chunk::from_dense(&dense)
     }
-}
-
-/// Generates a square grid of chunks (`2 * radius_chunks + 1` on a side, in x/z)
-/// covering the full vertical range, in parallel.
-pub fn generate_world(radius_chunks: i32, seed: u32) -> World {
-    let generator = TerrainGenerator::new(seed);
-
-    let mut positions = Vec::new();
-    for cz in -radius_chunks..=radius_chunks {
-        for cx in -radius_chunks..=radius_chunks {
-            for cy in 0..VERTICAL_CHUNKS {
-                positions.push(ChunkPos::new(cx, cy, cz));
-            }
-        }
-    }
-
-    let chunks: Vec<(ChunkPos, Chunk)> = positions
-        .par_iter()
-        .map(|&pos| (pos, generator.generate_chunk(pos)))
-        .collect();
-
-    let mut world = World::new();
-    for (pos, chunk) in chunks {
-        world.insert_chunk(pos, chunk);
-    }
-    world
 }

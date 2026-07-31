@@ -1,5 +1,6 @@
 pub mod camera;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use wgpu::util::DeviceExt;
@@ -17,8 +18,6 @@ pub enum RenderOutcome {
 }
 
 struct GpuChunkMesh {
-    #[allow(dead_code)]
-    chunk_pos: ChunkPos,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
@@ -35,7 +34,7 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    chunk_meshes: Vec<GpuChunkMesh>,
+    chunk_meshes: HashMap<ChunkPos, GpuChunkMesh>,
     pub window: Arc<Window>,
 }
 
@@ -203,7 +202,7 @@ impl Renderer {
             pipeline,
             camera_buffer,
             camera_bind_group,
-            chunk_meshes: Vec::new(),
+            chunk_meshes: HashMap::new(),
             window,
         }
     }
@@ -222,14 +221,21 @@ impl Renderer {
         self.depth_view = create_depth_view(&self.device, width, height);
     }
 
-    pub fn set_chunk_meshes(&mut self, meshes: Vec<(ChunkPos, ChunkMesh)>) {
-        self.chunk_meshes = meshes
-            .into_iter()
-            .map(|(chunk_pos, mesh)| self.upload_chunk_mesh(chunk_pos, &mesh))
-            .collect();
+    /// Uploads/replaces the GPU mesh for a chunk, or drops it if the new mesh is empty.
+    pub fn upsert_chunk_mesh(&mut self, chunk_pos: ChunkPos, mesh: &ChunkMesh) {
+        if mesh.is_empty() {
+            self.chunk_meshes.remove(&chunk_pos);
+            return;
+        }
+        let gpu_mesh = self.upload_chunk_mesh(mesh);
+        self.chunk_meshes.insert(chunk_pos, gpu_mesh);
     }
 
-    fn upload_chunk_mesh(&self, chunk_pos: ChunkPos, mesh: &ChunkMesh) -> GpuChunkMesh {
+    pub fn remove_chunk_mesh(&mut self, chunk_pos: ChunkPos) {
+        self.chunk_meshes.remove(&chunk_pos);
+    }
+
+    fn upload_chunk_mesh(&self, mesh: &ChunkMesh) -> GpuChunkMesh {
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -245,7 +251,6 @@ impl Renderer {
                 usage: wgpu::BufferUsages::INDEX,
             });
         GpuChunkMesh {
-            chunk_pos,
             vertex_buffer,
             index_buffer,
             index_count: mesh.indices.len() as u32,
@@ -317,7 +322,7 @@ impl Renderer {
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            for mesh in &self.chunk_meshes {
+            for mesh in self.chunk_meshes.values() {
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 render_pass
                     .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);

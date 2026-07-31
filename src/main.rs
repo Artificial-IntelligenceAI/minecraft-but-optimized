@@ -17,14 +17,23 @@ use render::{
     RenderOutcome, Renderer,
     camera::{Camera, FlyCameraController},
 };
-use world::{generation, meshing};
+use world::World;
+use world::streaming::{ChunkStreamer, StreamingUpdate};
 
-/// Render distance in chunks (radius), in x/z, around the origin.
-const WORLD_RADIUS_CHUNKS: i32 = 4;
 const WORLD_SEED: u32 = 1;
+/// Chunk columns are always kept loaded within this radius of the camera.
+const LOAD_RADIUS_CHUNKS: i32 = 6;
+/// Columns are only unloaded once they exceed this (wider) radius, to avoid
+/// load/unload thrashing when hovering near the load boundary.
+const UNLOAD_RADIUS_CHUNKS: i32 = 8;
+/// New columns loaded per frame once already playing; the initial load
+/// around spawn uses an unbounded budget so there's no visible void at start.
+const STREAM_COLUMNS_PER_FRAME: usize = 4;
 
 struct AppState {
     renderer: Renderer,
+    world: World,
+    streamer: ChunkStreamer,
     camera: Camera,
     controller: FlyCameraController,
     last_frame: Instant,
@@ -32,28 +41,26 @@ struct AppState {
 
 impl AppState {
     async fn new(window: Arc<Window>) -> Self {
-        let renderer = Renderer::new(window).await;
-
-        log::info!("generating world (radius {WORLD_RADIUS_CHUNKS} chunks)...");
-        let gen_start = Instant::now();
-        let world = generation::generate_world(WORLD_RADIUS_CHUNKS, WORLD_SEED);
-        log::info!("world generated in {:?}", gen_start.elapsed());
-
-        let mesh_start = Instant::now();
-        let meshes = meshing::mesh_world(&world);
-        log::info!(
-            "meshed {} chunks in {:?}",
-            meshes.len(),
-            mesh_start.elapsed()
-        );
-
-        let mut renderer = renderer;
-        renderer.set_chunk_meshes(meshes);
+        let mut renderer = Renderer::new(window).await;
+        let mut world = World::new();
+        let mut streamer = ChunkStreamer::new(WORLD_SEED, LOAD_RADIUS_CHUNKS, UNLOAD_RADIUS_CHUNKS);
 
         let camera = Camera::new(Vec3::new(0.0, 110.0, 0.0), renderer.aspect_ratio());
 
+        log::info!("priming world around spawn...");
+        let prime_start = Instant::now();
+        let update = streamer.update(&mut world, camera.position, usize::MAX);
+        let loaded_chunks = update.meshes.len();
+        apply_streaming_update(&mut renderer, update);
+        log::info!(
+            "primed {loaded_chunks} chunks in {:?}",
+            prime_start.elapsed()
+        );
+
         Self {
             renderer,
+            world,
+            streamer,
             camera,
             controller: FlyCameraController::default(),
             last_frame: Instant::now(),
@@ -72,6 +79,15 @@ impl AppState {
         }
         window.set_cursor_visible(!grabbed);
         self.controller.cursor_grabbed = grabbed;
+    }
+}
+
+fn apply_streaming_update(renderer: &mut Renderer, update: StreamingUpdate) {
+    for (chunk_pos, mesh) in update.meshes {
+        renderer.upsert_chunk_mesh(chunk_pos, &mesh);
+    }
+    for chunk_pos in update.removed {
+        renderer.remove_chunk_mesh(chunk_pos);
     }
 }
 
@@ -138,6 +154,13 @@ impl ApplicationHandler for App {
                 state.last_frame = now;
 
                 state.controller.update(&mut state.camera, dt);
+
+                let update = state.streamer.update(
+                    &mut state.world,
+                    state.camera.position,
+                    STREAM_COLUMNS_PER_FRAME,
+                );
+                apply_streaming_update(&mut state.renderer, update);
 
                 match state.renderer.render(&state.camera) {
                     RenderOutcome::Ok | RenderOutcome::Skip => {}
