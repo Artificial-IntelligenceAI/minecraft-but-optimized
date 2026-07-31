@@ -4,12 +4,12 @@ use super::quad::UiQuad;
 use super::text::UiTextLine;
 use crate::chat::{Chat, MessageKind};
 
-const FONT_SIZE: f32 = 16.0;
-const LINE_HEIGHT: f32 = 20.0;
-const PANEL_MARGIN_LEFT: f32 = 8.0;
-const PANEL_MARGIN_BOTTOM: f32 = 40.0;
-const PANEL_MAX_WIDTH: f32 = 600.0;
-const TEXT_PADDING_X: f32 = 4.0;
+const FONT_SIZE: f32 = 30.0;
+const LINE_HEIGHT: f32 = 38.0;
+const PANEL_MARGIN_LEFT: f32 = 12.0;
+const PANEL_MARGIN_BOTTOM: f32 = 70.0;
+const PANEL_MAX_WIDTH: f32 = 1000.0;
+const TEXT_PADDING_X: f32 = 8.0;
 /// No text-shaping pass available here to measure real glyph widths, so the
 /// cursor position is approximated using a fixed per-character advance for
 /// the monospace font `text.rs` requests.
