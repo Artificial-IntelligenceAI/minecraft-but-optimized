@@ -240,6 +240,17 @@ impl Renderer {
         self.depth_view = create_depth_view(&self.device, width, height);
     }
 
+    /// Toggles vsync at runtime (see `/settings fps sync`) by reconfiguring
+    /// the surface's present mode.
+    pub fn set_vsync(&mut self, enabled: bool) {
+        self.config.present_mode = if enabled {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        self.surface.configure(&self.device, &self.config);
+    }
+
     /// Uploads/replaces the GPU mesh for a chunk, or drops it if the new mesh is empty.
     pub fn upsert_chunk_mesh(&mut self, chunk_pos: ChunkPos, mesh: &ChunkMesh) {
         if mesh.is_empty() {
@@ -276,7 +287,12 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, camera: &camera::Camera, chat: &Chat, fps: u32) -> RenderOutcome {
+    pub fn render(
+        &mut self,
+        camera: &camera::Camera,
+        chat: &Chat,
+        fps: Option<u32>,
+    ) -> RenderOutcome {
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -350,10 +366,12 @@ impl Renderer {
         }
 
         let draw_data = chat_view::build(chat, self.config.width as f32, self.config.height as f32);
-        let fps_data = fps_view::build(fps);
+        let fps_data = fps.map(fps_view::build);
 
         let mut quads = draw_data.quads;
-        quads.push(fps_data.quad);
+        if let Some(fps_data) = &fps_data {
+            quads.push(fps_data.quad);
+        }
 
         let mut text_lines = draw_data.text_lines;
         if let Some(ghost) = &draw_data.ghost {
@@ -366,7 +384,9 @@ impl Renderer {
                 max_width: ghost.max_width,
             });
         }
-        text_lines.push(fps_view::text_line(&fps_data));
+        if let Some(fps_data) = &fps_data {
+            text_lines.push(fps_view::text_line(fps_data));
+        }
 
         self.ui_text.prepare(
             &self.device,

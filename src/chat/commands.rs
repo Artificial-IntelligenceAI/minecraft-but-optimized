@@ -5,7 +5,7 @@ use crate::world::streaming::ChunkStreamer;
 pub const MIN_RENDER_DISTANCE: i32 = 1;
 pub const MAX_RENDER_DISTANCE: i32 = 512;
 
-/// Cap applied by `/settings maxfps true` — a plain on/off toggle doesn't say
+/// Cap applied by `/settings fps max true` — a plain on/off toggle doesn't say
 /// *what* to cap at, so this is the value it means by "capped".
 pub const DEFAULT_CAPPED_FPS: u32 = 60;
 pub const MIN_FPS_CAP: u32 = 1;
@@ -14,12 +14,19 @@ pub const MAX_FPS_CAP: u32 = 1000;
 pub struct CommandResponse {
     pub text: String,
     pub kind: MessageKind,
+    /// Set by `/settings fps sync`. Applying it means reconfiguring the GPU
+    /// surface, which needs a live `Renderer` — something this module
+    /// deliberately has no access to (constructing one is async and needs a
+    /// real window/GPU, which would drag that requirement into every test
+    /// here). The caller applies this effect instead.
+    pub set_vsync: Option<bool>,
 }
 
 fn ok(text: impl Into<String>) -> CommandResponse {
     CommandResponse {
         text: text.into(),
         kind: MessageKind::CommandOk,
+        set_vsync: None,
     }
 }
 
@@ -27,8 +34,14 @@ fn err(text: impl Into<String>) -> CommandResponse {
     CommandResponse {
         text: text.into(),
         kind: MessageKind::CommandError,
+        set_vsync: None,
     }
 }
+
+/// Newline-separated, not comma-separated: this is long enough that a single
+/// line either overflows the chat box or reads as a wall of text. `text`
+/// (see [`CommandResponse`]) is rendered as one chat line per `\n`.
+const SETTINGS_USAGE: &str = "Usage:\n/settings rd <chunks>\n/settings fps max <true|false|number>\n/settings fps counter <true|false>\n/settings fps sync <true|false>";
 
 /// Executes a chat line that starts with `/` (the leading slash is optional
 /// here — callers may strip it themselves) against live game state.
@@ -41,9 +54,9 @@ pub fn execute(input: &str, streamer: &mut ChunkStreamer, fps: &mut FpsCounter) 
             let args: Vec<&str> = tokens.collect();
             execute_settings(&args, streamer, fps)
         }
-        Some("help") => {
-            ok("Commands: /settings rd <chunks>, /settings maxfps <true|false|number>, /help")
-        }
+        Some("help") => ok(
+            "Commands:\n/settings rd <chunks>\n/settings fps max <true|false|number>\n/settings fps counter <true|false>\n/settings fps sync <true|false>\n/help",
+        ),
         Some(other) => err(format!(
             "Unknown command: /{other}. Type /help for a list of commands."
         )),
@@ -68,18 +81,28 @@ fn execute_settings(
             Err(_) => err(format!("'{value}' is not a number.")),
         },
         ["rd"] => err("Usage: /settings rd <chunks>"),
-        ["maxfps", value] => execute_maxfps(value, fps),
-        ["maxfps"] => err("Usage: /settings maxfps <true|false> or /settings maxfps <number>"),
-        [sub, ..] => err(format!(
-            "Unknown settings subcommand: {sub}. Available: rd, maxfps"
+        ["fps", "max", value] => execute_fps_max(value, fps),
+        ["fps", "max"] => {
+            err("Usage: /settings fps max <true|false> or /settings fps max <number>")
+        }
+        ["fps", "counter", value] => execute_fps_counter(value, fps),
+        ["fps", "counter"] => err("Usage: /settings fps counter <true|false>"),
+        ["fps", "sync", value] => execute_fps_sync(value),
+        ["fps", "sync"] => err("Usage: /settings fps sync <true|false>"),
+        ["fps", sub, ..] => err(format!(
+            "Unknown fps subcommand: {sub}. Available: max, counter, sync"
         )),
-        [] => err("Usage: /settings rd <chunks> or /settings maxfps <true|false|number>"),
+        ["fps"] => err("Usage: /settings fps <max|counter|sync> ..."),
+        [sub, ..] => err(format!(
+            "Unknown settings subcommand: {sub}. Available: rd, fps"
+        )),
+        [] => err(SETTINGS_USAGE),
     }
 }
 
 /// `true` caps at [`DEFAULT_CAPPED_FPS`], `false` uncaps, and a plain number
 /// caps at that exact value (and implies capping is on).
-fn execute_maxfps(value: &str, fps: &mut FpsCounter) -> CommandResponse {
+fn execute_fps_max(value: &str, fps: &mut FpsCounter) -> CommandResponse {
     if let Ok(capped) = value.parse::<bool>() {
         return if capped {
             fps.cap = Some(DEFAULT_CAPPED_FPS);
@@ -102,6 +125,34 @@ fn execute_maxfps(value: &str, fps: &mut FpsCounter) -> CommandResponse {
     }
 }
 
+fn execute_fps_counter(value: &str, fps: &mut FpsCounter) -> CommandResponse {
+    match value.parse::<bool>() {
+        Ok(show) => {
+            fps.show = show;
+            ok(if show {
+                "FPS counter shown."
+            } else {
+                "FPS counter hidden."
+            })
+        }
+        Err(_) => err(format!("'{value}' is not true or false.")),
+    }
+}
+
+fn execute_fps_sync(value: &str) -> CommandResponse {
+    match value.parse::<bool>() {
+        Ok(enabled) => CommandResponse {
+            set_vsync: Some(enabled),
+            ..ok(if enabled {
+                "Vsync enabled."
+            } else {
+                "Vsync disabled."
+            })
+        },
+        Err(_) => err(format!("'{value}' is not true or false.")),
+    }
+}
+
 /// A command's literal token sequence plus an optional trailing argument hint,
 /// e.g. `["settings", "rd"]` + `Some("<chunks>")` for `/settings rd <chunks>`.
 struct CommandSpec {
@@ -119,8 +170,16 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         arg_hint: Some("<chunks>"),
     },
     CommandSpec {
-        tokens: &["settings", "maxfps"],
+        tokens: &["settings", "fps", "max"],
         arg_hint: Some("<true|false|number>"),
+    },
+    CommandSpec {
+        tokens: &["settings", "fps", "counter"],
+        arg_hint: Some("<true|false>"),
+    },
+    CommandSpec {
+        tokens: &["settings", "fps", "sync"],
+        arg_hint: Some("<true|false>"),
     },
 ];
 
@@ -263,49 +322,104 @@ mod tests {
     }
 
     #[test]
-    fn maxfps_true_caps_at_default() {
+    fn fps_max_true_caps_at_default() {
         let mut streamer = streamer();
         let mut fps = FpsCounter::new();
-        let response = execute("/settings maxfps true", &mut streamer, &mut fps);
+        let response = execute("/settings fps max true", &mut streamer, &mut fps);
         assert_eq!(response.text, "FPS capped at 60.");
         assert_eq!(fps.cap, Some(DEFAULT_CAPPED_FPS));
     }
 
     #[test]
-    fn maxfps_false_uncaps() {
+    fn fps_max_false_uncaps() {
         let mut streamer = streamer();
         let mut fps = FpsCounter::new();
         fps.cap = Some(30);
-        let response = execute("/settings maxfps false", &mut streamer, &mut fps);
+        let response = execute("/settings fps max false", &mut streamer, &mut fps);
         assert_eq!(response.text, "FPS uncapped.");
         assert_eq!(fps.cap, None);
     }
 
     #[test]
-    fn maxfps_number_sets_exact_cap() {
+    fn fps_max_number_sets_exact_cap() {
         let mut streamer = streamer();
         let mut fps = FpsCounter::new();
-        let response = execute("/settings maxfps 144", &mut streamer, &mut fps);
+        let response = execute("/settings fps max 144", &mut streamer, &mut fps);
         assert_eq!(response.text, "FPS capped at 144.");
         assert_eq!(fps.cap, Some(144));
     }
 
     #[test]
-    fn maxfps_rejects_out_of_range_number() {
+    fn fps_max_rejects_out_of_range_number() {
         let mut streamer = streamer();
         let mut fps = FpsCounter::new();
-        let response = execute("/settings maxfps 5000", &mut streamer, &mut fps);
+        let response = execute("/settings fps max 5000", &mut streamer, &mut fps);
         assert!(matches!(response.kind, MessageKind::CommandError));
         assert_eq!(fps.cap, None, "invalid input must not change state");
     }
 
     #[test]
-    fn maxfps_rejects_garbage() {
+    fn fps_max_rejects_garbage() {
         let mut streamer = streamer();
         let mut fps = FpsCounter::new();
-        let response = execute("/settings maxfps banana", &mut streamer, &mut fps);
+        let response = execute("/settings fps max banana", &mut streamer, &mut fps);
         assert!(matches!(response.kind, MessageKind::CommandError));
         assert_eq!(fps.cap, None);
+    }
+
+    #[test]
+    fn fps_counter_true_shows_it() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        fps.show = false;
+        let response = execute("/settings fps counter true", &mut streamer, &mut fps);
+        assert_eq!(response.text, "FPS counter shown.");
+        assert!(fps.show);
+    }
+
+    #[test]
+    fn fps_counter_false_hides_it() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings fps counter false", &mut streamer, &mut fps);
+        assert_eq!(response.text, "FPS counter hidden.");
+        assert!(!fps.show);
+    }
+
+    #[test]
+    fn fps_counter_rejects_garbage() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings fps counter banana", &mut streamer, &mut fps);
+        assert!(matches!(response.kind, MessageKind::CommandError));
+        assert!(fps.show, "invalid input must not change state");
+    }
+
+    #[test]
+    fn fps_sync_true_reports_vsync_effect() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings fps sync true", &mut streamer, &mut fps);
+        assert_eq!(response.text, "Vsync enabled.");
+        assert_eq!(response.set_vsync, Some(true));
+    }
+
+    #[test]
+    fn fps_sync_false_reports_vsync_effect() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings fps sync false", &mut streamer, &mut fps);
+        assert_eq!(response.text, "Vsync disabled.");
+        assert_eq!(response.set_vsync, Some(false));
+    }
+
+    #[test]
+    fn fps_sync_rejects_garbage() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings fps sync banana", &mut streamer, &mut fps);
+        assert!(matches!(response.kind, MessageKind::CommandError));
+        assert_eq!(response.set_vsync, None);
     }
 
     #[test]
@@ -314,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_prefix_is_ambiguous_between_rd_and_maxfps() {
+    fn settings_prefix_is_ambiguous_between_rd_and_fps() {
         assert!(suggest("/settings").is_none());
         assert!(suggest("/settings ").is_none());
     }
@@ -326,10 +440,31 @@ mod tests {
     }
 
     #[test]
-    fn settings_m_disambiguates_to_maxfps() {
-        let s = suggest("/settings m").unwrap();
-        assert_eq!(s.ghost_tail, "axfps <true|false|number>");
-        assert_eq!(s.tab_insert.as_deref(), Some("axfps "));
+    fn settings_fps_prefix_is_ambiguous_among_max_counter_sync() {
+        assert!(suggest("/settings f").is_none());
+        assert!(suggest("/settings fps").is_none());
+        assert!(suggest("/settings fps ").is_none());
+    }
+
+    #[test]
+    fn settings_fps_m_disambiguates_to_max() {
+        let s = suggest("/settings fps m").unwrap();
+        assert_eq!(s.ghost_tail, "ax <true|false|number>");
+        assert_eq!(s.tab_insert.as_deref(), Some("ax "));
+    }
+
+    #[test]
+    fn settings_fps_c_disambiguates_to_counter() {
+        let s = suggest("/settings fps c").unwrap();
+        assert_eq!(s.ghost_tail, "ounter <true|false>");
+        assert_eq!(s.tab_insert.as_deref(), Some("ounter "));
+    }
+
+    #[test]
+    fn settings_fps_s_disambiguates_to_sync() {
+        let s = suggest("/settings fps s").unwrap();
+        assert_eq!(s.ghost_tail, "ync <true|false>");
+        assert_eq!(s.tab_insert.as_deref(), Some("ync "));
     }
 
     #[test]

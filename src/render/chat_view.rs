@@ -136,5 +136,5 @@ fn cursor_blink_on() -> bool {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    (millis / 500) % 2 == 0
+    (millis / 500).is_multiple_of(2)
 }

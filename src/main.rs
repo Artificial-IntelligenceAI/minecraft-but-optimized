@@ -120,7 +120,15 @@ impl AppState {
             self.chat
                 .push_message(format!("/{command}"), MessageKind::CommandEcho);
             let response = commands::execute(command, &mut self.streamer, &mut self.fps);
-            self.chat.push_message(response.text, response.kind);
+            if let Some(enabled) = response.set_vsync {
+                self.renderer.set_vsync(enabled);
+            }
+            // Some responses (e.g. /help) are multiple logical lines joined
+            // by '\n' rather than one long line, since the chat box clips
+            // text to its width instead of wrapping it.
+            for line in response.text.split('\n') {
+                self.chat.push_message(line.to_string(), response.kind);
+            }
         } else {
             self.chat.push_message(line, MessageKind::Chat);
         }
@@ -206,10 +214,10 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::PageUp) => state.chat.scroll_up(),
                             PhysicalKey::Code(KeyCode::PageDown) => state.chat.scroll_down(),
                             PhysicalKey::Code(KeyCode::Tab) => {
-                                if let Some(suggestion) = commands::suggest(&state.chat.input) {
-                                    if let Some(insert) = suggestion.tab_insert {
-                                        state.chat.apply_completion(&insert);
-                                    }
+                                if let Some(insert) = commands::suggest(&state.chat.input)
+                                    .and_then(|suggestion| suggestion.tab_insert)
+                                {
+                                    state.chat.apply_completion(&insert);
                                 }
                             }
                             _ => {
@@ -256,10 +264,11 @@ impl ApplicationHandler for App {
                 apply_streaming_update(&mut state.renderer, update);
 
                 state.fps.tick();
+                let fps_display = state.fps.show.then_some(state.fps.current);
 
                 match state
                     .renderer
-                    .render(&state.camera, &state.chat, state.fps.current)
+                    .render(&state.camera, &state.chat, fps_display)
                 {
                     RenderOutcome::Ok | RenderOutcome::Skip => {}
                     RenderOutcome::Reconfigure => {
