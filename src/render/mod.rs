@@ -379,7 +379,7 @@ impl Renderer {
                 text: &ghost.text,
                 x: ghost.x,
                 y: ghost.y,
-                color: [140, 140, 140, 200],
+                color: [255, 255, 85, 220],
                 font_size: ghost.font_size,
                 max_width: ghost.max_width,
             });
