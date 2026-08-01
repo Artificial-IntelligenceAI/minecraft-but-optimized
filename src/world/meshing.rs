@@ -5,12 +5,23 @@ use super::block::{self, BlockId};
 use super::chunk::CHUNK_SIZE_I32;
 use super::{ChunkPos, World, chunk_origin};
 
+/// A packed 8-byte chunk vertex (down from 36 bytes as separate f32 fields).
+/// `packed` holds local-space position (0..=CHUNK_SIZE, 6 bits per axis) plus
+/// a face-normal index (3 bits, see `shader.wgsl`'s `FACE_NORMALS`), since
+/// greedy-meshed chunk faces are always axis-aligned. World-space position is
+/// reconstructed in the vertex shader from this plus a per-chunk origin,
+/// supplied separately as an instanced vertex attribute (see
+/// `render::chunk_arena`) rather than baked into every vertex.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct ChunkVertex {
-    pub position: [f32; 3],
-    pub normal: [f32; 3],
-    pub color: [f32; 3],
+    pub packed: u32,
+    pub color: [u8; 4],
+}
+
+fn pack_vertex(local: [i32; 3], normal_index: u32) -> u32 {
+    debug_assert!(local.iter().all(|&c| (0..=CHUNK_SIZE_I32).contains(&c)));
+    (local[0] as u32) | ((local[1] as u32) << 6) | ((local[2] as u32) << 12) | (normal_index << 18)
 }
 
 pub struct ChunkMesh {
@@ -121,7 +132,6 @@ pub fn mesh_chunk(world: &World, chunk_pos: ChunkPos) -> ChunkMesh {
                     emit_quad(
                         &mut vertices,
                         &mut indices,
-                        origin,
                         d,
                         u,
                         v,
@@ -153,7 +163,6 @@ pub fn mesh_chunk(world: &World, chunk_pos: ChunkPos) -> ChunkMesh {
 fn emit_quad(
     vertices: &mut Vec<ChunkVertex>,
     indices: &mut Vec<u32>,
-    origin: IVec3,
     d: usize,
     u: usize,
     v: usize,
@@ -164,17 +173,12 @@ fn emit_quad(
     h: i32,
     entry: MaskEntry,
 ) {
-    let origin = [origin.x, origin.y, origin.z];
-    let corner = |along_u: i32, along_v: i32| -> [f32; 3] {
+    let corner = |along_u: i32, along_v: i32| -> [i32; 3] {
         let mut p = [0i32; 3];
         p[d] = plane;
         p[u] = i + along_u;
         p[v] = j + along_v;
-        [
-            (p[0] + origin[0]) as f32,
-            (p[1] + origin[1]) as f32,
-            (p[2] + origin[2]) as f32,
-        ]
+        p
     };
 
     let c00 = corner(0, 0);
@@ -182,10 +186,17 @@ fn emit_quad(
     let c11 = corner(w, h);
     let c01 = corner(0, h);
 
-    let mut normal = [0.0f32; 3];
-    normal[d] = if entry.backface { -1.0 } else { 1.0 };
+    // Matches `FACE_NORMALS` in shader.wgsl: axis `d` contributes index
+    // `d * 2`, with `+ 1` for the negative-facing (backface) direction.
+    let normal_index = (d as u32) * 2 + entry.backface as u32;
 
-    let color = block::color(entry.block);
+    let [r, g, b] = block::color(entry.block);
+    let color = [
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
+        255,
+    ];
     let base = vertices.len() as u32;
 
     let quad = if entry.backface {
@@ -194,10 +205,9 @@ fn emit_quad(
         [c00, c10, c11, c01]
     };
 
-    for pos in quad {
+    for local in quad {
         vertices.push(ChunkVertex {
-            position: pos,
-            normal,
+            packed: pack_vertex(local, normal_index),
             color,
         });
     }

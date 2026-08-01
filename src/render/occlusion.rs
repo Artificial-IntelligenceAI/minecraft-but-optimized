@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -40,17 +41,43 @@ const CUBE_INDICES: [u16; 36] = [
     1, 5, 6, 6, 2, 1, // +X
 ];
 
-/// GPU hardware occlusion queries for chunk bounding boxes, with one frame
-/// of latency: a chunk's visibility this frame reflects a test run against
-/// *last* frame's depth buffer, since testing against "what's already drawn
-/// this frame" necessarily has to happen after the real geometry pass.
-/// Chunks default to visible until tested, so nothing waits a frame to
-/// appear when it first loads.
+/// A readback whose resolve/copy has been recorded but not yet submitted —
+/// `map_async` can only be called once that submission actually happens
+/// (see `begin_readback`), since a buffer can't be mapped for CPU reads
+/// while GPU commands writing to it are still unsubmitted.
+struct AwaitingSubmit {
+    tested: Vec<ChunkPos>,
+    buffer_index: usize,
+}
+
+/// A readback that's been submitted to the GPU and had `map_async` called,
+/// but not yet confirmed mapped.
+struct Pending {
+    tested: Vec<ChunkPos>,
+    buffer_index: usize,
+    receiver: Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+/// GPU hardware occlusion queries for chunk bounding boxes, with results
+/// applied asynchronously: `poll` never blocks the CPU on the GPU, so a
+/// chunk's visibility can lag by more than one frame under heavy load
+/// instead of stalling every frame waiting for the query readback (the
+/// tradeoff a synchronous version would force). Two readback buffers are
+/// ping-ponged so a new query pass never has to wait on the previous one's
+/// map still being read.
 pub struct OcclusionCuller {
     pipeline: wgpu::RenderPipeline,
     query_set: wgpu::QuerySet,
     resolve_buffer: wgpu::Buffer,
-    readback_buffer: wgpu::Buffer,
+    readback_buffers: [wgpu::Buffer; 2],
+    /// Which of `readback_buffers` the *next* `record_queries` call should
+    /// target, alternated independently of `pending` (which is always
+    /// `None` by the time a new call is allowed — see
+    /// `ready_for_new_queries`) so consecutive passes never reuse the same
+    /// buffer while its previous map could theoretically still be settling.
+    next_buffer: usize,
+    awaiting_submit: Option<AwaitingSubmit>,
+    pending: Option<Pending>,
     visible: HashMap<ChunkPos, bool>,
 }
 
@@ -128,18 +155,23 @@ impl OcclusionCuller {
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("occlusion readback buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let make_readback_buffer = || {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("occlusion readback buffer"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
 
         Self {
             pipeline,
             query_set,
             resolve_buffer,
-            readback_buffer,
+            readback_buffers: [make_readback_buffer(), make_readback_buffer()],
+            next_buffer: 0,
+            awaiting_submit: None,
+            pending: None,
             visible: HashMap::new(),
         }
     }
@@ -160,27 +192,90 @@ impl OcclusionCuller {
         self.visible.remove(&pos);
     }
 
+    /// A new query pass can only be recorded once the previous one's
+    /// readback buffer is free again (i.e. its results have been consumed
+    /// by `poll`, or it was never used). With two ping-ponged buffers this
+    /// is only ever false when the GPU has fallen more than a frame behind.
+    pub fn ready_for_new_queries(&self) -> bool {
+        self.pending.is_none() && self.awaiting_submit.is_none()
+    }
+
+    /// Non-blocking: checks whether the in-flight readback (if any) has
+    /// finished mapping yet, and if so applies its results to `visible` and
+    /// frees it up for reuse. Call once per frame, before deciding whether
+    /// to record new queries.
+    pub fn poll(&mut self, device: &wgpu::Device) {
+        let _ = device.poll(wgpu::PollType::Poll);
+
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let Ok(result) = pending.receiver.try_recv() else {
+            return;
+        };
+        result.expect("failed to map occlusion readback buffer");
+
+        let size = (pending.tested.len() as u64) * 8;
+        let buffer = &self.readback_buffers[pending.buffer_index];
+        let slice = buffer.slice(0..size);
+        {
+            let view = slice.get_mapped_range().expect("occlusion buffer not mapped");
+            let results: &[u64] = bytemuck::cast_slice(&view);
+            for (&pos, &passed) in pending.tested.iter().zip(results) {
+                self.visible.insert(pos, passed != 0);
+            }
+        }
+        buffer.unmap();
+        self.pending = None;
+    }
+
+    /// Starts the CPU-side map of the readback buffer that `record_queries`
+    /// just wrote into. Must be called only after the encoder containing
+    /// that write has actually been submitted — mapping a buffer that a
+    /// not-yet-submitted command still targets is a validation error.
+    pub fn begin_readback(&mut self) {
+        let Some(awaiting) = self.awaiting_submit.take() else {
+            return;
+        };
+        let size = (awaiting.tested.len() as u64) * 8;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.readback_buffers[awaiting.buffer_index]
+            .slice(0..size)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        self.pending = Some(Pending {
+            tested: awaiting.tested,
+            buffer_index: awaiting.buffer_index,
+            receiver: rx,
+        });
+    }
+
     /// Draws a bounding-box proxy per chunk in `tested`, each wrapped in its
     /// own occlusion query, against the depth buffer as it stands right now
     /// — i.e. call this *after* the real geometry pass for the frame, so
-    /// it's testing against what's actually already drawn. Schedules the
-    /// results to be resolved into a readable buffer; call `read_results`
-    /// with the same slice once the encoder has been submitted.
+    /// it's testing against what's actually already drawn. Records the
+    /// resolve into a readback buffer; call `begin_readback` once this
+    /// encoder has actually been submitted to start the async map, then
+    /// `poll` on later frames to pick up the result.
+    ///
+    /// Only call this when `ready_for_new_queries()` is true.
     pub fn record_queries(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         depth_view: &wgpu::TextureView,
         camera_bind_group: &wgpu::BindGroup,
-        tested: &[ChunkPos],
+        tested: Vec<ChunkPos>,
     ) {
+        debug_assert!(self.pending.is_none() && self.awaiting_submit.is_none());
         if tested.is_empty() {
             return;
         }
 
         let mut vertices = Vec::with_capacity(tested.len() * CUBE_CORNERS.len());
         let mut indices = Vec::with_capacity(tested.len() * CUBE_INDICES.len());
-        for &pos in tested {
+        for &pos in &tested {
             let (min, _) = super::chunk_aabb(pos);
             let base = vertices.len() as u32;
             for corner in CUBE_CORNERS {
@@ -236,52 +331,23 @@ impl OcclusionCuller {
             }
         }
 
-        encoder.resolve_query_set(
-            &self.query_set,
-            0..tested.len() as u32,
-            &self.resolve_buffer,
-            0,
-        );
+        let size = (tested.len() as u64) * 8;
+        encoder.resolve_query_set(&self.query_set, 0..tested.len() as u32, &self.resolve_buffer, 0);
+
+        let buffer_index = self.next_buffer;
+        self.next_buffer = 1 - self.next_buffer;
+
         encoder.copy_buffer_to_buffer(
             &self.resolve_buffer,
             0,
-            &self.readback_buffer,
+            &self.readback_buffers[buffer_index],
             0,
-            (tested.len() as u64) * 8,
+            size,
         );
-    }
 
-    /// Blocks until the queries from the last `record_queries` call (which
-    /// must already have been submitted) resolve, then updates visibility
-    /// for each chunk in `tested`.
-    ///
-    /// This stalls the CPU on the GPU once a frame — an accepted tradeoff
-    /// for a first version that prioritizes obvious correctness over a
-    /// fully async double-buffered readback, which would trade the stall
-    /// for an extra frame of latency instead.
-    pub fn read_results(&mut self, device: &wgpu::Device, tested: &[ChunkPos]) {
-        if tested.is_empty() {
-            return;
-        }
-
-        let size = (tested.len() as u64) * 8;
-        let slice = self.readback_buffer.slice(0..size);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
+        self.awaiting_submit = Some(AwaitingSubmit {
+            tested,
+            buffer_index,
         });
-        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-        rx.recv()
-            .expect("occlusion readback callback never fired")
-            .expect("failed to map occlusion readback buffer");
-
-        {
-            let view = slice.get_mapped_range().expect("occlusion buffer not mapped");
-            let results: &[u64] = bytemuck::cast_slice(&view);
-            for (&pos, &passed) in tested.iter().zip(results) {
-                self.visible.insert(pos, passed != 0);
-            }
-        }
-        self.readback_buffer.unmap();
     }
 }

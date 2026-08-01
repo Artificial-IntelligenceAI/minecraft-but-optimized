@@ -1,5 +1,6 @@
 pub mod camera;
 mod chat_view;
+mod chunk_arena;
 mod fps_view;
 mod occlusion;
 mod quad;
@@ -15,6 +16,7 @@ use crate::chat::Chat;
 use crate::world::ChunkPos;
 use crate::world::meshing::{ChunkMesh, ChunkVertex};
 use camera::CameraUniform;
+use chunk_arena::GpuArena;
 use occlusion::OcclusionCuller;
 use quad::QuadRenderer;
 use text::{UiText, UiTextLine};
@@ -26,11 +28,21 @@ pub enum RenderOutcome {
     Fatal,
 }
 
-struct GpuChunkMesh {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
+/// Where one chunk's geometry lives within the shared vertex/index/origin
+/// arenas (see `chunk_arena`), in the units each arena's draw parameter
+/// needs: byte offsets for `alloc`/`free`, but element offsets for
+/// `draw_indexed`'s `base_vertex`/index-range/instance-range.
+struct ChunkSlot {
+    vertex_offset: u64,
+    vertex_count: u32,
+    index_offset: u64,
     index_count: u32,
+    origin_offset: u64,
 }
+
+const CHUNK_VERTEX_SIZE: u64 = std::mem::size_of::<ChunkVertex>() as u64;
+const CHUNK_INDEX_SIZE: u64 = std::mem::size_of::<u32>() as u64;
+const CHUNK_ORIGIN_SIZE: u64 = std::mem::size_of::<[f32; 3]>() as u64;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -43,7 +55,10 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    chunk_meshes: HashMap<ChunkPos, GpuChunkMesh>,
+    vertex_arena: GpuArena,
+    index_arena: GpuArena,
+    origin_arena: GpuArena,
+    chunk_slots: HashMap<ChunkPos, ChunkSlot>,
     occlusion: OcclusionCuller,
     quad_renderer: QuadRenderer,
     ui_text: UiText,
@@ -149,25 +164,33 @@ impl Renderer {
         });
 
         let vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<ChunkVertex>() as wgpu::BufferAddress,
+            array_stride: CHUNK_VERTEX_SIZE as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
                     offset: 0,
                     shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
+                    format: wgpu::VertexFormat::Uint32,
                 },
                 wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    offset: std::mem::size_of::<u32>() as wgpu::BufferAddress,
                     shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress,
-                    shader_location: 2,
-                    format: wgpu::VertexFormat::Float32x3,
+                    format: wgpu::VertexFormat::Unorm8x4,
                 },
             ],
+        };
+
+        // Per-chunk world-space origin, stepped once per instance rather
+        // than baked into every vertex — see `chunk_arena` and
+        // `world::meshing::ChunkVertex`'s doc comment.
+        let origin_layout = wgpu::VertexBufferLayout {
+            array_stride: CHUNK_ORIGIN_SIZE as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x3,
+            }],
         };
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -177,7 +200,7 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[Some(vertex_layout)],
+                buffers: &[Some(vertex_layout), Some(origin_layout)],
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -212,6 +235,28 @@ impl Renderer {
 
         let occlusion = OcclusionCuller::new(&device, &camera_bind_group_layout, DEPTH_FORMAT);
 
+        // 1 MiB starting capacity for vertices/indices (grows on demand, see
+        // `GpuArena::grow`); origins are tiny (12 bytes/chunk) so a few
+        // thousand chunks' worth costs nothing to start with generously.
+        let vertex_arena = GpuArena::new(
+            &device,
+            "chunk vertex arena",
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            1 << 20,
+        );
+        let index_arena = GpuArena::new(
+            &device,
+            "chunk index arena",
+            wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            1 << 20,
+        );
+        let origin_arena = GpuArena::new(
+            &device,
+            "chunk origin arena",
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            CHUNK_ORIGIN_SIZE * 4096,
+        );
+
         let quad_renderer = QuadRenderer::new(&device, config.format);
         let ui_text = UiText::new(&device, &queue, config.format);
 
@@ -224,7 +269,10 @@ impl Renderer {
             pipeline,
             camera_buffer,
             camera_bind_group,
-            chunk_meshes: HashMap::new(),
+            vertex_arena,
+            index_arena,
+            origin_arena,
+            chunk_slots: HashMap::new(),
             occlusion,
             quad_renderer,
             ui_text,
@@ -259,39 +307,61 @@ impl Renderer {
 
     /// Uploads/replaces the GPU mesh for a chunk, or drops it if the new mesh is empty.
     pub fn upsert_chunk_mesh(&mut self, chunk_pos: ChunkPos, mesh: &ChunkMesh) {
+        self.remove_chunk_mesh(chunk_pos);
         if mesh.is_empty() {
-            self.chunk_meshes.remove(&chunk_pos);
             return;
         }
-        let gpu_mesh = self.upload_chunk_mesh(mesh);
-        self.chunk_meshes.insert(chunk_pos, gpu_mesh);
+
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
+        let vertex_offset =
+            self.vertex_arena
+                .alloc(&self.device, &self.queue, vertex_bytes.len() as u64);
+        self.queue
+            .write_buffer(self.vertex_arena.buffer(), vertex_offset, vertex_bytes);
+
+        let index_bytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
+        let index_offset =
+            self.index_arena
+                .alloc(&self.device, &self.queue, index_bytes.len() as u64);
+        self.queue
+            .write_buffer(self.index_arena.buffer(), index_offset, index_bytes);
+
+        let origin = crate::world::chunk_origin(chunk_pos).as_vec3().to_array();
+        let origin_offset =
+            self.origin_arena
+                .alloc(&self.device, &self.queue, CHUNK_ORIGIN_SIZE);
+        self.queue.write_buffer(
+            self.origin_arena.buffer(),
+            origin_offset,
+            bytemuck::bytes_of(&origin),
+        );
+
+        self.chunk_slots.insert(
+            chunk_pos,
+            ChunkSlot {
+                vertex_offset,
+                vertex_count: mesh.vertices.len() as u32,
+                index_offset,
+                index_count: mesh.indices.len() as u32,
+                origin_offset,
+            },
+        );
     }
 
     pub fn remove_chunk_mesh(&mut self, chunk_pos: ChunkPos) {
-        self.chunk_meshes.remove(&chunk_pos);
-        self.occlusion.forget(chunk_pos);
-    }
-
-    fn upload_chunk_mesh(&self, mesh: &ChunkMesh) -> GpuChunkMesh {
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("chunk vertex buffer"),
-                contents: bytemuck::cast_slice(&mesh.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("chunk index buffer"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-        GpuChunkMesh {
-            vertex_buffer,
-            index_buffer,
-            index_count: mesh.indices.len() as u32,
+        if let Some(slot) = self.chunk_slots.remove(&chunk_pos) {
+            self.vertex_arena.free(
+                slot.vertex_offset,
+                slot.vertex_count as u64 * CHUNK_VERTEX_SIZE,
+            );
+            self.index_arena.free(
+                slot.index_offset,
+                slot.index_count as u64 * CHUNK_INDEX_SIZE,
+            );
+            self.origin_arena
+                .free(slot.origin_offset, CHUNK_ORIGIN_SIZE);
         }
+        self.occlusion.forget(chunk_pos);
     }
 
     pub fn render(
@@ -325,6 +395,10 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Non-blocking: applies whichever previous occlusion readback (if
+        // any) has finished mapping since last frame.
+        self.occlusion.poll(&self.device);
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -333,7 +407,7 @@ impl Renderer {
 
         let frustum = camera::Frustum::from_view_proj(camera.view_proj());
         let mut frustum_visible: Vec<ChunkPos> = self
-            .chunk_meshes
+            .chunk_slots
             .keys()
             .copied()
             .filter(|&pos| {
@@ -374,32 +448,45 @@ impl Renderer {
 
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            // Bound once for every chunk this frame — chunks are shared
+            // arena allocations now, not individually-owned buffers, so
+            // there's nothing to rebind per draw (see `chunk_arena`).
+            render_pass.set_vertex_buffer(0, self.vertex_arena.buffer().slice(..));
+            render_pass.set_vertex_buffer(1, self.origin_arena.buffer().slice(..));
+            render_pass
+                .set_index_buffer(self.index_arena.buffer().slice(..), wgpu::IndexFormat::Uint32);
 
             for &chunk_pos in &frustum_visible {
                 if !self.occlusion.is_visible(chunk_pos) {
                     continue;
                 }
-                let mesh = &self.chunk_meshes[&chunk_pos];
-                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                let slot = &self.chunk_slots[&chunk_pos];
+                let base_vertex = (slot.vertex_offset / CHUNK_VERTEX_SIZE) as i32;
+                let index_start = (slot.index_offset / CHUNK_INDEX_SIZE) as u32;
+                let instance = (slot.origin_offset / CHUNK_ORIGIN_SIZE) as u32;
+                render_pass.draw_indexed(
+                    index_start..index_start + slot.index_count,
+                    base_vertex,
+                    instance..instance + 1,
+                );
             }
         }
 
         // Re-test frustum-visible chunks against the depth buffer we just
         // drew, so `self.occlusion` reflects this frame's geometry for use
-        // in *next* frame's draw decision (one frame of latency, see
-        // `OcclusionCuller`).
-        frustum_visible.truncate(self.occlusion.capacity());
-        let occlusion_tested = frustum_visible;
-        self.occlusion.record_queries(
-            &self.device,
-            &mut encoder,
-            &self.depth_view,
-            &self.camera_bind_group,
-            &occlusion_tested,
-        );
+        // in a future frame's draw decision (see `OcclusionCuller`). Only
+        // when the previous readback has already been applied — otherwise
+        // this frame just keeps drawing by last-known visibility.
+        if self.occlusion.ready_for_new_queries() {
+            frustum_visible.truncate(self.occlusion.capacity());
+            self.occlusion.record_queries(
+                &self.device,
+                &mut encoder,
+                &self.depth_view,
+                &self.camera_bind_group,
+                frustum_visible,
+            );
+        }
 
         let draw_data = chat_view::build(chat, self.config.width as f32, self.config.height as f32);
         let fps_data = fps.map(fps_view::build);
@@ -464,7 +551,9 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
 
-        self.occlusion.read_results(&self.device, &occlusion_tested);
+        // Only valid now that the copy recorded in `record_queries` has
+        // actually been submitted (see `OcclusionCuller::begin_readback`).
+        self.occlusion.begin_readback();
 
         RenderOutcome::Ok
     }
