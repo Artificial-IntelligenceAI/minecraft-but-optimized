@@ -7,6 +7,9 @@ pub struct FpsCounter {
     frames_this_window: u32,
     window_start: Instant,
     pub current: u32,
+    /// Software frame-rate cap (see `/settings maxfps`). `None` (the
+    /// default) means uncapped — render as fast as the GPU/event loop allow.
+    pub cap: Option<u32>,
 }
 
 impl FpsCounter {
@@ -15,6 +18,7 @@ impl FpsCounter {
             frames_this_window: 0,
             window_start: Instant::now(),
             current: 0,
+            cap: None,
         }
     }
 

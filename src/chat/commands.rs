@@ -1,8 +1,15 @@
 use super::MessageKind;
+use crate::fps::FpsCounter;
 use crate::world::streaming::ChunkStreamer;
 
 pub const MIN_RENDER_DISTANCE: i32 = 1;
 pub const MAX_RENDER_DISTANCE: i32 = 512;
+
+/// Cap applied by `/settings maxfps true` — a plain on/off toggle doesn't say
+/// *what* to cap at, so this is the value it means by "capped".
+pub const DEFAULT_CAPPED_FPS: u32 = 60;
+pub const MIN_FPS_CAP: u32 = 1;
+pub const MAX_FPS_CAP: u32 = 1000;
 
 pub struct CommandResponse {
     pub text: String,
@@ -25,16 +32,18 @@ fn err(text: impl Into<String>) -> CommandResponse {
 
 /// Executes a chat line that starts with `/` (the leading slash is optional
 /// here — callers may strip it themselves) against live game state.
-pub fn execute(input: &str, streamer: &mut ChunkStreamer) -> CommandResponse {
+pub fn execute(input: &str, streamer: &mut ChunkStreamer, fps: &mut FpsCounter) -> CommandResponse {
     let trimmed = input.strip_prefix('/').unwrap_or(input);
     let mut tokens = trimmed.split_whitespace();
 
     match tokens.next() {
         Some("settings") => {
             let args: Vec<&str> = tokens.collect();
-            execute_settings(&args, streamer)
+            execute_settings(&args, streamer, fps)
         }
-        Some("help") => ok("Commands: /settings rd <chunks>, /help"),
+        Some("help") => {
+            ok("Commands: /settings rd <chunks>, /settings maxfps <true|false|number>, /help")
+        }
         Some(other) => err(format!(
             "Unknown command: /{other}. Type /help for a list of commands."
         )),
@@ -42,7 +51,11 @@ pub fn execute(input: &str, streamer: &mut ChunkStreamer) -> CommandResponse {
     }
 }
 
-fn execute_settings(args: &[&str], streamer: &mut ChunkStreamer) -> CommandResponse {
+fn execute_settings(
+    args: &[&str],
+    streamer: &mut ChunkStreamer,
+    fps: &mut FpsCounter,
+) -> CommandResponse {
     match args {
         ["rd", value] => match value.parse::<i32>() {
             Ok(n) if (MIN_RENDER_DISTANCE..=MAX_RENDER_DISTANCE).contains(&n) => {
@@ -55,8 +68,37 @@ fn execute_settings(args: &[&str], streamer: &mut ChunkStreamer) -> CommandRespo
             Err(_) => err(format!("'{value}' is not a number.")),
         },
         ["rd"] => err("Usage: /settings rd <chunks>"),
-        [sub, ..] => err(format!("Unknown settings subcommand: {sub}. Available: rd")),
-        [] => err("Usage: /settings rd <chunks>"),
+        ["maxfps", value] => execute_maxfps(value, fps),
+        ["maxfps"] => err("Usage: /settings maxfps <true|false> or /settings maxfps <number>"),
+        [sub, ..] => err(format!(
+            "Unknown settings subcommand: {sub}. Available: rd, maxfps"
+        )),
+        [] => err("Usage: /settings rd <chunks> or /settings maxfps <true|false|number>"),
+    }
+}
+
+/// `true` caps at [`DEFAULT_CAPPED_FPS`], `false` uncaps, and a plain number
+/// caps at that exact value (and implies capping is on).
+fn execute_maxfps(value: &str, fps: &mut FpsCounter) -> CommandResponse {
+    if let Ok(capped) = value.parse::<bool>() {
+        return if capped {
+            fps.cap = Some(DEFAULT_CAPPED_FPS);
+            ok(format!("FPS capped at {DEFAULT_CAPPED_FPS}."))
+        } else {
+            fps.cap = None;
+            ok("FPS uncapped.")
+        };
+    }
+
+    match value.parse::<u32>() {
+        Ok(n) if (MIN_FPS_CAP..=MAX_FPS_CAP).contains(&n) => {
+            fps.cap = Some(n);
+            ok(format!("FPS capped at {n}."))
+        }
+        Ok(n) => err(format!(
+            "FPS cap must be between {MIN_FPS_CAP} and {MAX_FPS_CAP} (got {n})."
+        )),
+        Err(_) => err(format!("'{value}' is not true, false, or a number.")),
     }
 }
 
@@ -75,6 +117,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         tokens: &["settings", "rd"],
         arg_hint: Some("<chunks>"),
+    },
+    CommandSpec {
+        tokens: &["settings", "maxfps"],
+        arg_hint: Some("<true|false|number>"),
     },
 ];
 
@@ -161,7 +207,8 @@ mod tests {
     #[test]
     fn settings_rd_sets_load_radius() {
         let mut streamer = streamer();
-        let response = execute("/settings rd 10", &mut streamer);
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings rd 10", &mut streamer, &mut fps);
         assert_eq!(response.text, "Render distance set to 10 chunks.");
         assert!(matches!(response.kind, MessageKind::CommandOk));
         assert_eq!(streamer.load_radius(), 10);
@@ -170,7 +217,8 @@ mod tests {
     #[test]
     fn settings_rd_rejects_out_of_range() {
         let mut streamer = streamer();
-        let response = execute("/settings rd 999", &mut streamer);
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings rd 999", &mut streamer, &mut fps);
         assert!(matches!(response.kind, MessageKind::CommandError));
         assert_eq!(
             streamer.load_radius(),
@@ -182,7 +230,8 @@ mod tests {
     #[test]
     fn settings_rd_rejects_non_numeric() {
         let mut streamer = streamer();
-        let response = execute("/settings rd banana", &mut streamer);
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings rd banana", &mut streamer, &mut fps);
         assert!(matches!(response.kind, MessageKind::CommandError));
         assert_eq!(streamer.load_radius(), 6);
     }
@@ -190,14 +239,16 @@ mod tests {
     #[test]
     fn settings_rd_missing_argument_shows_usage() {
         let mut streamer = streamer();
-        let response = execute("/settings rd", &mut streamer);
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings rd", &mut streamer, &mut fps);
         assert_eq!(response.text, "Usage: /settings rd <chunks>");
     }
 
     #[test]
     fn unknown_command_is_reported() {
         let mut streamer = streamer();
-        let response = execute("/foo", &mut streamer);
+        let mut fps = FpsCounter::new();
+        let response = execute("/foo", &mut streamer, &mut fps);
         assert!(matches!(response.kind, MessageKind::CommandError));
         assert!(response.text.contains("/foo"));
     }
@@ -205,9 +256,56 @@ mod tests {
     #[test]
     fn leading_slash_is_optional() {
         let mut streamer = streamer();
-        let response = execute("settings rd 4", &mut streamer);
+        let mut fps = FpsCounter::new();
+        let response = execute("settings rd 4", &mut streamer, &mut fps);
         assert_eq!(streamer.load_radius(), 4);
         let _ = response;
+    }
+
+    #[test]
+    fn maxfps_true_caps_at_default() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings maxfps true", &mut streamer, &mut fps);
+        assert_eq!(response.text, "FPS capped at 60.");
+        assert_eq!(fps.cap, Some(DEFAULT_CAPPED_FPS));
+    }
+
+    #[test]
+    fn maxfps_false_uncaps() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        fps.cap = Some(30);
+        let response = execute("/settings maxfps false", &mut streamer, &mut fps);
+        assert_eq!(response.text, "FPS uncapped.");
+        assert_eq!(fps.cap, None);
+    }
+
+    #[test]
+    fn maxfps_number_sets_exact_cap() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings maxfps 144", &mut streamer, &mut fps);
+        assert_eq!(response.text, "FPS capped at 144.");
+        assert_eq!(fps.cap, Some(144));
+    }
+
+    #[test]
+    fn maxfps_rejects_out_of_range_number() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings maxfps 5000", &mut streamer, &mut fps);
+        assert!(matches!(response.kind, MessageKind::CommandError));
+        assert_eq!(fps.cap, None, "invalid input must not change state");
+    }
+
+    #[test]
+    fn maxfps_rejects_garbage() {
+        let mut streamer = streamer();
+        let mut fps = FpsCounter::new();
+        let response = execute("/settings maxfps banana", &mut streamer, &mut fps);
+        assert!(matches!(response.kind, MessageKind::CommandError));
+        assert_eq!(fps.cap, None);
     }
 
     #[test]
@@ -216,17 +314,29 @@ mod tests {
     }
 
     #[test]
+    fn settings_prefix_is_ambiguous_between_rd_and_maxfps() {
+        assert!(suggest("/settings").is_none());
+        assert!(suggest("/settings ").is_none());
+    }
+
+    #[test]
+    fn settings_r_disambiguates_to_rd() {
+        let s = suggest("/settings r").unwrap();
+        assert_eq!(s.ghost_tail, "d <chunks>");
+    }
+
+    #[test]
+    fn settings_m_disambiguates_to_maxfps() {
+        let s = suggest("/settings m").unwrap();
+        assert_eq!(s.ghost_tail, "axfps <true|false|number>");
+        assert_eq!(s.tab_insert.as_deref(), Some("axfps "));
+    }
+
+    #[test]
     fn partial_token_suggests_rest_of_that_word() {
         let s = suggest("/h").unwrap();
         assert_eq!(s.ghost_tail, "elp");
         assert_eq!(s.tab_insert.as_deref(), Some("elp "));
-    }
-
-    #[test]
-    fn completed_first_token_suggests_next_token_and_hint() {
-        let s = suggest("/settings").unwrap();
-        assert_eq!(s.ghost_tail, " rd <chunks>");
-        assert_eq!(s.tab_insert.as_deref(), Some(" "));
     }
 
     #[test]

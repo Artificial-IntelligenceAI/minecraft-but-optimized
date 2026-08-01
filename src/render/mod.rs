@@ -87,7 +87,12 @@ impl Renderer {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: surface_caps.present_modes[0],
+            // Vsync off / uncapped by default; actual FPS capping (if any) is
+            // done in software via frame pacing (see `fps::FpsCounter`), not
+            // by switching present modes, since that's the only way to hit
+            // arbitrary cap values instead of just "whatever the display's
+            // refresh rate is".
+            present_mode: wgpu::PresentMode::AutoNoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,

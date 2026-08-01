@@ -119,7 +119,7 @@ impl AppState {
         if let Some(command) = line.strip_prefix('/') {
             self.chat
                 .push_message(format!("/{command}"), MessageKind::CommandEcho);
-            let response = commands::execute(command, &mut self.streamer);
+            let response = commands::execute(command, &mut self.streamer, &mut self.fps);
             self.chat.push_message(response.text, response.kind);
         } else {
             self.chat.push_message(line, MessageKind::Chat);
@@ -295,9 +295,29 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
-            state.renderer.window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = &self.state else {
+            return;
+        };
+
+        match state.fps.cap {
+            Some(cap) if cap > 0 => {
+                // Software frame pacing: uncapped rendering (the default) just
+                // polls flat-out, but hitting an arbitrary cap like 144 needs
+                // actual pacing since present modes only give you "uncapped"
+                // or "synced to the display's refresh rate", not arbitrary
+                // values. `WaitUntil` parks the loop instead of busy-spinning.
+                let next = state.last_frame + std::time::Duration::from_secs_f64(1.0 / cap as f64);
+                if Instant::now() >= next {
+                    state.renderer.window.request_redraw();
+                } else {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                }
+            }
+            _ => {
+                event_loop.set_control_flow(ControlFlow::Poll);
+                state.renderer.window.request_redraw();
+            }
         }
     }
 }
