@@ -1,10 +1,10 @@
 use super::quad::UiQuad;
 use super::text::UiTextLine;
 
-const FONT_SIZE: f32 = 24.0;
-const MARGIN: f32 = 10.0;
-const HEIGHT: f32 = 32.0;
-const PADDING_X: f32 = 8.0;
+const FONT_SIZE: f32 = 44.0;
+const MARGIN: f32 = 14.0;
+const HEIGHT: f32 = 58.0;
+const PADDING_X: f32 = 12.0;
 /// Matches the monospace-advance approximation used elsewhere for UI text
 /// (see `chat_view::APPROX_CHAR_WIDTH`) — sizes the backdrop to the text.
 const APPROX_CHAR_WIDTH: f32 = FONT_SIZE * 0.6;
