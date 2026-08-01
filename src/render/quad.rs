@@ -9,6 +9,7 @@ struct QuadVertex {
 }
 
 /// A flat-colored rectangle in pixel space, origin top-left (matching window coordinates).
+#[derive(Clone, Copy)]
 pub struct UiQuad {
     pub x: f32,
     pub y: f32,

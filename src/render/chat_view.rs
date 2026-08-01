@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::quad::UiQuad;
 use super::text::UiTextLine;
-use crate::chat::{Chat, MessageKind};
+use crate::chat::{Chat, MessageKind, commands};
 
 const FONT_SIZE: f32 = 30.0;
 const LINE_HEIGHT: f32 = 38.0;
@@ -18,11 +18,25 @@ const APPROX_CHAR_WIDTH: f32 = FONT_SIZE * 0.6;
 pub struct ChatDrawData<'a> {
     pub quads: Vec<UiQuad>,
     pub text_lines: Vec<UiTextLine<'a>>,
+    /// Command "ghost" suggestion (gray completion text shown after the
+    /// cursor), kept separate from `text_lines` because its text is computed
+    /// here — owned by this struct — rather than borrowed from `chat` like
+    /// everything else in `text_lines`.
+    pub ghost: Option<GhostSuggestion>,
+}
+
+pub struct GhostSuggestion {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub max_width: f32,
+    pub font_size: f32,
 }
 
 pub fn build(chat: &Chat, screen_width: f32, screen_height: f32) -> ChatDrawData<'_> {
     let mut quads = Vec::new();
     let mut text_lines = Vec::new();
+    let mut ghost = None;
 
     let panel_width = PANEL_MAX_WIDTH
         .min(screen_width - PANEL_MARGIN_LEFT * 2.0)
@@ -75,10 +89,22 @@ pub fn build(chat: &Chat, screen_width: f32, screen_height: f32) -> ChatDrawData
             max_width: text_max_width,
         });
 
+        let cursor_x = PANEL_MARGIN_LEFT
+            + TEXT_PADDING_X
+            + chat.input.chars().count() as f32 * APPROX_CHAR_WIDTH;
+
+        if let Some(suggestion) = commands::suggest(&chat.input) {
+            ghost = Some(GhostSuggestion {
+                text: suggestion.ghost_tail,
+                x: cursor_x,
+                y: input_y,
+                max_width: (text_max_width - chat.input.chars().count() as f32 * APPROX_CHAR_WIDTH)
+                    .max(0.0),
+                font_size: FONT_SIZE,
+            });
+        }
+
         if cursor_blink_on() {
-            let cursor_x = PANEL_MARGIN_LEFT
-                + TEXT_PADDING_X
-                + chat.input.chars().count() as f32 * APPROX_CHAR_WIDTH;
             quads.push(UiQuad {
                 x: cursor_x,
                 y: input_y + 2.0,
@@ -89,7 +115,11 @@ pub fn build(chat: &Chat, screen_width: f32, screen_height: f32) -> ChatDrawData
         }
     }
 
-    ChatDrawData { quads, text_lines }
+    ChatDrawData {
+        quads,
+        text_lines,
+        ghost,
+    }
 }
 
 fn kind_color(kind: MessageKind) -> [u8; 3] {

@@ -1,5 +1,6 @@
 pub mod camera;
 mod chat_view;
+mod fps_view;
 mod quad;
 mod text;
 
@@ -14,7 +15,7 @@ use crate::world::ChunkPos;
 use crate::world::meshing::{ChunkMesh, ChunkVertex};
 use camera::CameraUniform;
 use quad::QuadRenderer;
-use text::UiText;
+use text::{UiText, UiTextLine};
 
 pub enum RenderOutcome {
     Ok,
@@ -270,7 +271,7 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, camera: &camera::Camera, chat: &Chat) -> RenderOutcome {
+    pub fn render(&mut self, camera: &camera::Camera, chat: &Chat, fps: u32) -> RenderOutcome {
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -344,12 +345,30 @@ impl Renderer {
         }
 
         let draw_data = chat_view::build(chat, self.config.width as f32, self.config.height as f32);
+        let fps_data = fps_view::build(fps);
+
+        let mut quads = draw_data.quads;
+        quads.push(fps_data.quad);
+
+        let mut text_lines = draw_data.text_lines;
+        if let Some(ghost) = &draw_data.ghost {
+            text_lines.push(UiTextLine {
+                text: &ghost.text,
+                x: ghost.x,
+                y: ghost.y,
+                color: [140, 140, 140, 200],
+                font_size: ghost.font_size,
+                max_width: ghost.max_width,
+            });
+        }
+        text_lines.push(fps_view::text_line(&fps_data));
+
         self.ui_text.prepare(
             &self.device,
             &self.queue,
             self.config.width,
             self.config.height,
-            &draw_data.text_lines,
+            &text_lines,
         );
 
         {
@@ -375,7 +394,7 @@ impl Renderer {
                 &mut ui_pass,
                 self.config.width as f32,
                 self.config.height as f32,
-                &draw_data.quads,
+                &quads,
             );
             self.ui_text.render(&mut ui_pass);
         }

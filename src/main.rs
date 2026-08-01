@@ -1,4 +1,5 @@
 mod chat;
+mod fps;
 mod render;
 mod world;
 
@@ -15,6 +16,7 @@ use winit::{
 };
 
 use chat::{Chat, MessageKind, commands};
+use fps::FpsCounter;
 use render::{
     RenderOutcome, Renderer,
     camera::{Camera, FlyCameraController},
@@ -42,6 +44,7 @@ struct AppState {
     /// Whether the cursor was grabbed right before chat was opened, so
     /// closing chat can restore it instead of always re-grabbing.
     pre_chat_grabbed: bool,
+    fps: FpsCounter,
     last_frame: Instant,
 }
 
@@ -77,6 +80,7 @@ impl AppState {
             controller: FlyCameraController::default(),
             chat,
             pre_chat_grabbed: false,
+            fps: FpsCounter::new(),
             last_frame: Instant::now(),
         }
     }
@@ -201,6 +205,13 @@ impl ApplicationHandler for App {
                             PhysicalKey::Code(KeyCode::ArrowDown) => state.chat.history_next(),
                             PhysicalKey::Code(KeyCode::PageUp) => state.chat.scroll_up(),
                             PhysicalKey::Code(KeyCode::PageDown) => state.chat.scroll_down(),
+                            PhysicalKey::Code(KeyCode::Tab) => {
+                                if let Some(suggestion) = commands::suggest(&state.chat.input) {
+                                    if let Some(insert) = suggestion.tab_insert {
+                                        state.chat.apply_completion(&insert);
+                                    }
+                                }
+                            }
                             _ => {
                                 if let Some(text) = key_event.text.as_ref() {
                                     for c in text.chars().filter(|c| !c.is_control()) {
@@ -244,7 +255,12 @@ impl ApplicationHandler for App {
                 );
                 apply_streaming_update(&mut state.renderer, update);
 
-                match state.renderer.render(&state.camera, &state.chat) {
+                state.fps.tick();
+
+                match state
+                    .renderer
+                    .render(&state.camera, &state.chat, state.fps.current)
+                {
                     RenderOutcome::Ok | RenderOutcome::Skip => {}
                     RenderOutcome::Reconfigure => {
                         let (w, h) = (

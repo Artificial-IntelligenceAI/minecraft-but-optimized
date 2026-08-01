@@ -96,6 +96,11 @@ impl Chat {
         self.input.pop();
     }
 
+    /// Appends a Tab-completion's literal text (see [`commands::Suggestion::tab_insert`]).
+    pub fn apply_completion(&mut self, text: &str) {
+        self.input.push_str(text);
+    }
+
     /// Recalls older sent messages into the input, most-recent-first.
     pub fn history_prev(&mut self) {
         if self.sent_history.is_empty() {
