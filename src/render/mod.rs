@@ -59,6 +59,12 @@ pub struct Renderer {
     index_arena: GpuArena,
     origin_arena: GpuArena,
     chunk_slots: FxHashMap<ChunkPos, ChunkSlot>,
+    /// Scratch space for this frame's frustum-visible chunk list, reused
+    /// across frames instead of collecting into a fresh `Vec` each time.
+    /// `render` occasionally has to move it out (via `mem::take`) to hand
+    /// ownership to `OcclusionCuller`, which is fine — it just means that
+    /// frame's replacement `Vec` starts back at zero capacity.
+    frustum_visible: Vec<ChunkPos>,
     occlusion: OcclusionCuller,
     quad_renderer: QuadRenderer,
     ui_text: UiText,
@@ -273,6 +279,7 @@ impl Renderer {
             index_arena,
             origin_arena,
             chunk_slots: FxHashMap::default(),
+            frustum_visible: Vec::new(),
             occlusion,
             quad_renderer,
             ui_text,
@@ -406,15 +413,12 @@ impl Renderer {
             });
 
         let frustum = camera::Frustum::from_view_proj(camera.view_proj());
-        let mut frustum_visible: Vec<ChunkPos> = self
-            .chunk_slots
-            .keys()
-            .copied()
-            .filter(|&pos| {
+        self.frustum_visible.clear();
+        self.frustum_visible
+            .extend(self.chunk_slots.keys().copied().filter(|&pos| {
                 let (min, max) = chunk_aabb(pos);
                 frustum.intersects_aabb(min, max)
-            })
-            .collect();
+            }));
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -456,7 +460,7 @@ impl Renderer {
             render_pass
                 .set_index_buffer(self.index_arena.buffer().slice(..), wgpu::IndexFormat::Uint32);
 
-            for &chunk_pos in &frustum_visible {
+            for &chunk_pos in &self.frustum_visible {
                 if !self.occlusion.is_visible(chunk_pos) {
                     continue;
                 }
@@ -478,14 +482,18 @@ impl Renderer {
         // when the previous readback has already been applied — otherwise
         // this frame just keeps drawing by last-known visibility.
         if self.occlusion.ready_for_new_queries() {
-            frustum_visible.truncate(self.occlusion.capacity());
+            self.frustum_visible.truncate(self.occlusion.capacity());
+            // Takes ownership, leaving `self.frustum_visible` empty (but
+            // still a valid Vec) until next frame's `clear`/`extend` refills
+            // it — see the field's doc comment.
+            let tested = std::mem::take(&mut self.frustum_visible);
             self.occlusion.record_queries(
                 &self.device,
                 &self.queue,
                 &mut encoder,
                 &self.depth_view,
                 &self.camera_bind_group,
-                frustum_visible,
+                tested,
             );
         }
 

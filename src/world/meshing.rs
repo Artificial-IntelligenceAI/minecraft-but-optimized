@@ -52,9 +52,24 @@ pub fn mesh_chunk(world: &World, chunk_pos: ChunkPos) -> ChunkMesh {
     let origin = chunk_origin(chunk_pos);
     let dims = [CHUNK_SIZE_I32; 3];
 
+    // Of the three axes checked per voxel face, only the swept axis `d` ever
+    // steps outside this chunk (by exactly one voxel, to see the neighbor
+    // across the boundary) — `u`/`v` always stay in `0..CHUNK_SIZE`. So the
+    // overwhelming majority of lookups are against this same chunk; fetch it
+    // once and index straight into it instead of paying `World::get_block`'s
+    // div_euclid/rem_euclid-and-hashmap-lookup cost for every voxel.
+    let this_chunk = world.chunk(chunk_pos);
+    let in_bounds = |c: i32| (0..CHUNK_SIZE_I32).contains(&c);
+
     let solid_block_at = |local: [i32; 3]| -> Option<BlockId> {
-        let world_pos = origin + IVec3::new(local[0], local[1], local[2]);
-        let id = world.get_block(world_pos);
+        let id = if local.iter().copied().all(in_bounds) {
+            this_chunk.map_or(block::AIR, |chunk| {
+                chunk.get(local[0] as usize, local[1] as usize, local[2] as usize)
+            })
+        } else {
+            let world_pos = origin + IVec3::new(local[0], local[1], local[2]);
+            world.get_block(world_pos)
+        };
         if block::is_solid(id) { Some(id) } else { None }
     };
 

@@ -121,6 +121,10 @@ pub struct OcclusionCuller {
     /// `record_queries` — was `create_buffer_init` from scratch every frame.
     box_vertex_buffer: ScratchBuffer,
     box_index_buffer: ScratchBuffer,
+    /// CPU-side staging for the same box-proxy geometry, cleared and
+    /// refilled each call instead of collecting into fresh `Vec`s.
+    box_vertices: Vec<BoxVertex>,
+    box_indices: Vec<u32>,
     /// Which of `readback_buffers` the *next* `record_queries` call should
     /// target, alternated independently of `pending` (which is always
     /// `None` by the time a new call is allowed — see
@@ -233,6 +237,8 @@ impl OcclusionCuller {
             readback_buffers: [make_readback_buffer(), make_readback_buffer()],
             box_vertex_buffer,
             box_index_buffer,
+            box_vertices: Vec::new(),
+            box_indices: Vec::new(),
             next_buffer: 0,
             awaiting_submit: None,
             pending: None,
@@ -338,13 +344,13 @@ impl OcclusionCuller {
             return;
         }
 
-        let mut vertices = Vec::with_capacity(tested.len() * CUBE_CORNERS.len());
-        let mut indices = Vec::with_capacity(tested.len() * CUBE_INDICES.len());
+        self.box_vertices.clear();
+        self.box_indices.clear();
         for &pos in &tested {
             let (min, _) = super::chunk_aabb(pos);
-            let base = vertices.len() as u32;
+            let base = self.box_vertices.len() as u32;
             for corner in CUBE_CORNERS {
-                vertices.push(BoxVertex {
+                self.box_vertices.push(BoxVertex {
                     position: [
                         min.x + corner[0] * CHUNK_SIZE as f32,
                         min.y + corner[1] * CHUNK_SIZE as f32,
@@ -352,11 +358,12 @@ impl OcclusionCuller {
                     ],
                 });
             }
-            indices.extend(CUBE_INDICES.iter().map(|&i| base + i as u32));
+            self.box_indices
+                .extend(CUBE_INDICES.iter().map(|&i| base + i as u32));
         }
 
-        let vertex_bytes: &[u8] = bytemuck::cast_slice(&vertices);
-        let index_bytes: &[u8] = bytemuck::cast_slice(&indices);
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(&self.box_vertices);
+        let index_bytes: &[u8] = bytemuck::cast_slice(&self.box_indices);
         self.box_vertex_buffer.write(device, queue, vertex_bytes);
         self.box_index_buffer.write(device, queue, index_bytes);
         let vertex_buffer = self
