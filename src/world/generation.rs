@@ -16,8 +16,8 @@ const SURFACE_LAYER_DEPTH: i32 = 4;
 /// Caves carve stone away wherever this 3D noise field's value is close to
 /// zero — thresholding a single continuous field's zero-level-set naturally
 /// produces winding, tunnel-like voids rather than isolated round blobs.
-const CAVE_FREQUENCY: f64 = 0.045;
-const CAVE_THRESHOLD: f64 = 0.01;
+const CAVE_FREQUENCY: f64 = 0.008;
+const CAVE_THRESHOLD: f64 = 0.02;
 /// How far below the surface caves are allowed to start, kept comfortably
 /// past `SURFACE_LAYER_DEPTH` so a cave can never hole through the visible
 /// ground layer.
@@ -155,6 +155,62 @@ mod tests {
         let fraction = f64::from(carved) / f64::from(total);
         assert!(fraction > 0.005, "caves are too sparse: {fraction}");
         assert!(fraction < 0.2, "caves are too dense: {fraction}");
+    }
+
+    /// A density check alone doesn't catch caves that are technically
+    /// carved but only ever one voxel wide (uncrossable cracks, not
+    /// tunnels) — measure actual passage width via the run of carved
+    /// voxels through each cave point along the narrowest of the three
+    /// axes, which is what an earlier, higher-frequency/tighter-threshold
+    /// version of these constants got wrong.
+    #[test]
+    fn caves_are_wide_enough_to_walk_through() {
+        let generator = TerrainGenerator::new(0);
+        let run_length = |x: i32, y: i32, z: i32, axis: usize| -> i32 {
+            let step = |d: i32| -> [i32; 3] {
+                let mut p = [x, y, z];
+                p[axis] += d;
+                p
+            };
+            let mut len = 1;
+            let mut d = 1;
+            while {
+                let p = step(d);
+                generator.is_cave(p[0], p[1], p[2])
+            } {
+                len += 1;
+                d += 1;
+            }
+            let mut d = -1;
+            while {
+                let p = step(d);
+                generator.is_cave(p[0], p[1], p[2])
+            } {
+                len += 1;
+                d -= 1;
+            }
+            len
+        };
+
+        let mut widths = Vec::new();
+        for x in (0..300).step_by(3) {
+            for z in (0..300).step_by(3) {
+                for y in (0..40).step_by(3) {
+                    if generator.is_cave(x, y, z) {
+                        let w = run_length(x, y, z, 0)
+                            .min(run_length(x, y, z, 1))
+                            .min(run_length(x, y, z, 2));
+                        widths.push(w);
+                    }
+                }
+            }
+        }
+        widths.sort_unstable();
+        let median = widths[widths.len() / 2];
+        assert!(
+            median >= 3,
+            "caves are too narrow to walk through: median width {median}"
+        );
     }
 
     /// Caves must never reach into the dirt/grass/sand layer, so the
