@@ -9,6 +9,11 @@ pub struct UiTextLine<'a> {
     pub y: f32,
     pub color: [u8; 4],
     pub font_size: f32,
+    /// Wrap/clip width in pixels: text beyond this (wrapped onto further
+    /// lines, or simply overflowing) is not drawn. Without this, cosmic-text
+    /// only wraps at the buffer's configured width, which callers must set
+    /// to their own box width rather than the full screen.
+    pub max_width: f32,
 }
 
 /// Wraps glyphon (cosmic-text shaping + glyph atlas) for drawing 2D screen-space
@@ -57,7 +62,9 @@ impl UiText {
         for line in lines {
             let metrics = Metrics::new(line.font_size, line.font_size * 1.2);
             let mut buffer = Buffer::new(&mut self.font_system, metrics);
-            buffer.set_size(Some(width as f32), Some(height as f32));
+            // Wrap at the caller's box width, not the full screen — otherwise text
+            // just keeps running past the backdrop it's meant to sit inside.
+            buffer.set_size(Some(line.max_width), Some(line.font_size * 1.5));
             buffer.set_text(
                 line.text,
                 &Attrs::new().family(Family::Monospace),
@@ -77,7 +84,12 @@ impl UiText {
                 left: line.x,
                 top: line.y,
                 scale: 1.0,
-                bounds: TextBounds::default(),
+                bounds: TextBounds {
+                    left: line.x as i32,
+                    top: line.y as i32,
+                    right: (line.x + line.max_width) as i32,
+                    bottom: (line.y + line.font_size * 1.5) as i32,
+                },
                 default_color: Color::rgba(
                     line.color[0],
                     line.color[1],

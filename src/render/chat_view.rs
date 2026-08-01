@@ -8,7 +8,7 @@ const FONT_SIZE: f32 = 30.0;
 const LINE_HEIGHT: f32 = 38.0;
 const PANEL_MARGIN_LEFT: f32 = 12.0;
 const PANEL_MARGIN_BOTTOM: f32 = 70.0;
-const PANEL_MAX_WIDTH: f32 = 1000.0;
+const PANEL_MAX_WIDTH: f32 = 1600.0;
 const TEXT_PADDING_X: f32 = 8.0;
 /// No text-shaping pass available here to measure real glyph widths, so the
 /// cursor position is approximated using a fixed per-character advance for
@@ -28,6 +28,7 @@ pub fn build(chat: &Chat, screen_width: f32, screen_height: f32) -> ChatDrawData
         .min(screen_width - PANEL_MARGIN_LEFT * 2.0)
         .max(200.0);
     let visible = chat.visible_lines();
+    let text_max_width = panel_width - TEXT_PADDING_X * 2.0;
 
     let mut y = screen_height - PANEL_MARGIN_BOTTOM;
     if chat.is_open {
@@ -52,6 +53,7 @@ pub fn build(chat: &Chat, screen_width: f32, screen_height: f32) -> ChatDrawData
             y,
             color: [r, g, b, (255.0 * alpha) as u8],
             font_size: FONT_SIZE,
+            max_width: text_max_width,
         });
     }
 
@@ -70,6 +72,7 @@ pub fn build(chat: &Chat, screen_width: f32, screen_height: f32) -> ChatDrawData
             y: input_y,
             color: [255, 255, 255, 255],
             font_size: FONT_SIZE,
+            max_width: text_max_width,
         });
 
         if cursor_blink_on() {
