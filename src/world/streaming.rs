@@ -126,13 +126,12 @@ impl ChunkStreamer {
             }
         }
 
-        let new_chunk_positions: Vec<ChunkPos> = to_load
-            .iter()
-            .flat_map(|&(x, z)| (0..VERTICAL_CHUNKS).map(move |y| ChunkPos::new(x, y, z)))
-            .collect();
-        let generated: Vec<(ChunkPos, Chunk)> = new_chunk_positions
+        // Generated a whole column at a time (not per individual ChunkPos)
+        // so each column's heightmap noise is sampled once and shared
+        // across its VERTICAL_CHUNKS chunks — see `generate_column`.
+        let generated: Vec<(ChunkPos, Chunk)> = to_load
             .par_iter()
-            .map(|&pos| (pos, self.generator.generate_chunk(pos)))
+            .flat_map(|&(x, z)| self.generator.generate_column(x, z))
             .collect();
         for (pos, chunk) in generated {
             world.insert_chunk(pos, chunk);

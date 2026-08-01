@@ -1,7 +1,7 @@
 use noise::{Fbm, NoiseFn, Perlin};
 
 use super::block::{AIR, DIRT, GRASS, SAND, STONE};
-use super::chunk::{CHUNK_SIZE, Chunk, VOLUME, voxel_index};
+use super::chunk::{CHUNK_SIZE, CHUNK_SIZE_I32, Chunk, VOLUME, voxel_index};
 use super::{ChunkPos, chunk_origin};
 
 const SEA_LEVEL: i32 = 62;
@@ -33,15 +33,38 @@ impl TerrainGenerator {
         (BASE_HEIGHT + n * AMPLITUDE).round() as i32
     }
 
-    pub fn generate_chunk(&self, chunk_pos: ChunkPos) -> Chunk {
-        let origin = chunk_origin(chunk_pos);
+    /// Generates every vertically-stacked chunk in an (x, z) column at once.
+    /// `height_at` doesn't depend on the vertical chunk index, but chunk
+    /// streaming loads/unloads a whole column's `VERTICAL_CHUNKS` chunks
+    /// together (see `streaming::ChunkStreamer`) — generating them one
+    /// `ChunkPos` at a time would resample the same column's heightmap
+    /// noise up to `VERTICAL_CHUNKS` times over. Sampling it once here and
+    /// reusing it across all of them cuts that noise evaluation by 4x.
+    pub fn generate_column(&self, x: i32, z: i32) -> Vec<(ChunkPos, Chunk)> {
+        let world_origin_x = x * CHUNK_SIZE_I32;
+        let world_origin_z = z * CHUNK_SIZE_I32;
+        let mut heights = vec![0i32; CHUNK_SIZE * CHUNK_SIZE];
+        for cz in 0..CHUNK_SIZE {
+            for cx in 0..CHUNK_SIZE {
+                heights[cz * CHUNK_SIZE + cx] =
+                    self.height_at(world_origin_x + cx as i32, world_origin_z + cz as i32);
+            }
+        }
+
+        (0..VERTICAL_CHUNKS)
+            .map(|y| {
+                let pos = ChunkPos::new(x, y, z);
+                (pos, Self::fill_chunk(chunk_origin(pos), &heights))
+            })
+            .collect()
+    }
+
+    fn fill_chunk(origin: ChunkPos, heights: &[i32]) -> Chunk {
         let mut dense = vec![AIR; VOLUME];
 
         for z in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
-                let world_x = origin.x + x as i32;
-                let world_z = origin.z + z as i32;
-                let height = self.height_at(world_x, world_z);
+                let height = heights[z * CHUNK_SIZE + x];
 
                 for y in 0..CHUNK_SIZE {
                     let world_y = origin.y + y as i32;
