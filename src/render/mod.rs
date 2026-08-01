@@ -357,7 +357,12 @@ impl Renderer {
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            for mesh in self.chunk_meshes.values() {
+            let frustum = camera::Frustum::from_view_proj(camera.view_proj());
+            for (&chunk_pos, mesh) in &self.chunk_meshes {
+                let (min, max) = chunk_aabb(chunk_pos);
+                if !frustum.intersects_aabb(min, max) {
+                    continue;
+                }
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 render_pass
                     .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -430,6 +435,15 @@ impl Renderer {
 
         RenderOutcome::Ok
     }
+}
+
+/// World-space (min, max) corners of a chunk's cube, used for culling.
+fn chunk_aabb(pos: ChunkPos) -> (glam::Vec3, glam::Vec3) {
+    let origin = crate::world::chunk_origin(pos).as_vec3();
+    (
+        origin,
+        origin + glam::Vec3::splat(crate::world::chunk::CHUNK_SIZE as f32),
+    )
 }
 
 fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
