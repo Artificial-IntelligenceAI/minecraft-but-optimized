@@ -2,7 +2,7 @@ use super::MessageKind;
 use crate::world::streaming::ChunkStreamer;
 
 pub const MIN_RENDER_DISTANCE: i32 = 1;
-pub const MAX_RENDER_DISTANCE: i32 = 32;
+pub const MAX_RENDER_DISTANCE: i32 = 512;
 
 pub struct CommandResponse {
     pub text: String,

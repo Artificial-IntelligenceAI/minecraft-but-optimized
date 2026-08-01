@@ -31,6 +31,14 @@ pub struct ChunkStreamer {
     loaded_columns: HashSet<ColumnPos>,
     load_radius: i32,
     unload_radius: i32,
+    /// (center, load_radius, unload_radius) as of the last call that found
+    /// nothing left to load or unload. At small radii recomputing the full
+    /// candidate region every frame is cheap enough not to matter, but it's
+    /// O(radius^2) — at large radii (see `/settings rd`, which allows up to
+    /// 512) that's well over a million hashset lookups a frame, forever,
+    /// even standing still with everything already loaded. This lets an
+    /// unchanged, converged call short-circuit instead of redoing that scan.
+    converged: Option<(ColumnPos, i32, i32)>,
 }
 
 impl ChunkStreamer {
@@ -41,6 +49,7 @@ impl ChunkStreamer {
             loaded_columns: HashSet::new(),
             load_radius,
             unload_radius,
+            converged: None,
         }
     }
 
@@ -70,6 +79,14 @@ impl ChunkStreamer {
         load_budget: usize,
     ) -> StreamingUpdate {
         let center = world_pos_to_column(focus);
+
+        if self.converged == Some((center, self.load_radius, self.unload_radius)) {
+            return StreamingUpdate {
+                meshes: Vec::new(),
+                removed: Vec::new(),
+            };
+        }
+
         let load_radius_sq = self.load_radius * self.load_radius;
 
         // Both this and `to_unload` below use circular (Euclidean) distance from `center`.
@@ -85,6 +102,7 @@ impl ChunkStreamer {
             .filter(|col| !self.loaded_columns.contains(col))
             .collect();
         to_load.sort_by_key(|&(x, z)| column_dist_sq(center, (x, z)));
+        let candidates_needed = to_load.len();
         to_load.truncate(load_budget);
 
         let unload_radius_sq = self.unload_radius * self.unload_radius;
@@ -94,6 +112,12 @@ impl ChunkStreamer {
             .copied()
             .filter(|&col| column_dist_sq(center, col) > unload_radius_sq)
             .collect();
+
+        self.converged = (candidates_needed <= load_budget && to_unload.is_empty()).then_some((
+            center,
+            self.load_radius,
+            self.unload_radius,
+        ));
 
         let mut affected: HashSet<ColumnPos> = HashSet::new();
         for &col in to_load.iter().chain(&to_unload) {
@@ -201,6 +225,26 @@ mod tests {
         streamer.update(&mut world, Vec3::ZERO, 3);
 
         assert_eq!(streamer.loaded_columns.len(), 3);
+    }
+
+    #[test]
+    fn convergence_cache_does_not_prevent_a_widened_radius_from_loading_more() {
+        let mut world = World::new();
+        let mut streamer = ChunkStreamer::new(0, 2, 3);
+
+        // Reach convergence at radius 2.
+        streamer.update(&mut world, Vec3::ZERO, usize::MAX);
+        streamer.update(&mut world, Vec3::ZERO, usize::MAX);
+        assert!(streamer.converged.is_some());
+        assert!(world.chunk(ChunkPos::new(4, 0, 0)).is_none());
+
+        // Widening the radius must invalidate the cached convergence, not
+        // short-circuit into returning nothing forever.
+        streamer.set_load_radius(4);
+        let update = streamer.update(&mut world, Vec3::ZERO, usize::MAX);
+
+        assert!(!update.meshes.is_empty());
+        assert!(world.chunk(ChunkPos::new(4, 0, 0)).is_some());
     }
 
     #[test]
