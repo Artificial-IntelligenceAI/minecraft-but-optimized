@@ -1,6 +1,7 @@
 pub mod camera;
 mod chat_view;
 mod fps_view;
+mod occlusion;
 mod quad;
 mod text;
 
@@ -14,6 +15,7 @@ use crate::chat::Chat;
 use crate::world::ChunkPos;
 use crate::world::meshing::{ChunkMesh, ChunkVertex};
 use camera::CameraUniform;
+use occlusion::OcclusionCuller;
 use quad::QuadRenderer;
 use text::{UiText, UiTextLine};
 
@@ -42,6 +44,7 @@ pub struct Renderer {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     chunk_meshes: HashMap<ChunkPos, GpuChunkMesh>,
+    occlusion: OcclusionCuller,
     quad_renderer: QuadRenderer,
     ui_text: UiText,
     pub window: Arc<Window>,
@@ -207,6 +210,8 @@ impl Renderer {
             cache: None,
         });
 
+        let occlusion = OcclusionCuller::new(&device, &camera_bind_group_layout, DEPTH_FORMAT);
+
         let quad_renderer = QuadRenderer::new(&device, config.format);
         let ui_text = UiText::new(&device, &queue, config.format);
 
@@ -220,6 +225,7 @@ impl Renderer {
             camera_buffer,
             camera_bind_group,
             chunk_meshes: HashMap::new(),
+            occlusion,
             quad_renderer,
             ui_text,
             window,
@@ -263,6 +269,7 @@ impl Renderer {
 
     pub fn remove_chunk_mesh(&mut self, chunk_pos: ChunkPos) {
         self.chunk_meshes.remove(&chunk_pos);
+        self.occlusion.forget(chunk_pos);
     }
 
     fn upload_chunk_mesh(&self, mesh: &ChunkMesh) -> GpuChunkMesh {
@@ -324,6 +331,17 @@ impl Renderer {
                 label: Some("render encoder"),
             });
 
+        let frustum = camera::Frustum::from_view_proj(camera.view_proj());
+        let mut frustum_visible: Vec<ChunkPos> = self
+            .chunk_meshes
+            .keys()
+            .copied()
+            .filter(|&pos| {
+                let (min, max) = chunk_aabb(pos);
+                frustum.intersects_aabb(min, max)
+            })
+            .collect();
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("chunk pass"),
@@ -357,18 +375,31 @@ impl Renderer {
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            let frustum = camera::Frustum::from_view_proj(camera.view_proj());
-            for (&chunk_pos, mesh) in &self.chunk_meshes {
-                let (min, max) = chunk_aabb(chunk_pos);
-                if !frustum.intersects_aabb(min, max) {
+            for &chunk_pos in &frustum_visible {
+                if !self.occlusion.is_visible(chunk_pos) {
                     continue;
                 }
+                let mesh = &self.chunk_meshes[&chunk_pos];
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 render_pass
                     .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
         }
+
+        // Re-test frustum-visible chunks against the depth buffer we just
+        // drew, so `self.occlusion` reflects this frame's geometry for use
+        // in *next* frame's draw decision (one frame of latency, see
+        // `OcclusionCuller`).
+        frustum_visible.truncate(self.occlusion.capacity());
+        let occlusion_tested = frustum_visible;
+        self.occlusion.record_queries(
+            &self.device,
+            &mut encoder,
+            &self.depth_view,
+            &self.camera_bind_group,
+            &occlusion_tested,
+        );
 
         let draw_data = chat_view::build(chat, self.config.width as f32, self.config.height as f32);
         let fps_data = fps.map(fps_view::build);
@@ -432,6 +463,8 @@ impl Renderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         self.queue.present(frame);
+
+        self.occlusion.read_results(&self.device, &occlusion_tested);
 
         RenderOutcome::Ok
     }
