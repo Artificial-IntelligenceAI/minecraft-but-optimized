@@ -4,9 +4,8 @@ pub mod generation;
 pub mod meshing;
 pub mod streaming;
 
-use std::collections::HashMap;
-
 use glam::IVec3;
+use rustc_hash::FxHashMap;
 
 use chunk::{CHUNK_SIZE_I32, Chunk};
 
@@ -29,13 +28,16 @@ pub fn chunk_origin(chunk_pos: ChunkPos) -> IVec3 {
 }
 
 pub struct World {
-    chunks: HashMap<ChunkPos, Chunk>,
+    // `get_block` (FxHash, not the default SipHash) is on the hottest path
+    // in the engine: greedy meshing calls it roughly twice per voxel per
+    // chunk, across every chunk being remeshed, in parallel.
+    chunks: FxHashMap<ChunkPos, Chunk>,
 }
 
 impl World {
     pub fn new() -> Self {
         Self {
-            chunks: HashMap::new(),
+            chunks: FxHashMap::default(),
         }
     }
 

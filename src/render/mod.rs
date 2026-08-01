@@ -6,9 +6,9 @@ mod occlusion;
 mod quad;
 mod text;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -58,7 +58,7 @@ pub struct Renderer {
     vertex_arena: GpuArena,
     index_arena: GpuArena,
     origin_arena: GpuArena,
-    chunk_slots: HashMap<ChunkPos, ChunkSlot>,
+    chunk_slots: FxHashMap<ChunkPos, ChunkSlot>,
     occlusion: OcclusionCuller,
     quad_renderer: QuadRenderer,
     ui_text: UiText,
@@ -272,7 +272,7 @@ impl Renderer {
             vertex_arena,
             index_arena,
             origin_arena,
-            chunk_slots: HashMap::new(),
+            chunk_slots: FxHashMap::default(),
             occlusion,
             quad_renderer,
             ui_text,
@@ -481,6 +481,7 @@ impl Renderer {
             frustum_visible.truncate(self.occlusion.capacity());
             self.occlusion.record_queries(
                 &self.device,
+                &self.queue,
                 &mut encoder,
                 &self.depth_view,
                 &self.camera_bind_group,

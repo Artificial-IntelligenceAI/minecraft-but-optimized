@@ -1,7 +1,6 @@
-use std::collections::HashSet;
-
 use glam::Vec3;
 use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 
 use super::chunk::{CHUNK_SIZE_I32, Chunk};
 use super::generation::{TerrainGenerator, VERTICAL_CHUNKS};
@@ -28,7 +27,7 @@ pub struct StreamingUpdate {
 /// every frame.
 pub struct ChunkStreamer {
     generator: TerrainGenerator,
-    loaded_columns: HashSet<ColumnPos>,
+    loaded_columns: FxHashSet<ColumnPos>,
     load_radius: i32,
     unload_radius: i32,
     /// (center, load_radius, unload_radius) as of the last call that found
@@ -46,7 +45,7 @@ impl ChunkStreamer {
         assert!(unload_radius >= load_radius);
         Self {
             generator: TerrainGenerator::new(seed),
-            loaded_columns: HashSet::new(),
+            loaded_columns: FxHashSet::default(),
             load_radius,
             unload_radius,
             converged: None,
@@ -119,7 +118,7 @@ impl ChunkStreamer {
             self.unload_radius,
         ));
 
-        let mut affected: HashSet<ColumnPos> = HashSet::new();
+        let mut affected: FxHashSet<ColumnPos> = FxHashSet::default();
         for &col in to_load.iter().chain(&to_unload) {
             affected.insert(col);
             for (dx, dz) in NEIGHBOR_OFFSETS {

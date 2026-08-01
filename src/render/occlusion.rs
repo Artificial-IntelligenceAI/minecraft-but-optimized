@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
+use rustc_hash::FxHashMap;
 
 use crate::world::ChunkPos;
 use crate::world::chunk::CHUNK_SIZE;
@@ -41,6 +40,54 @@ const CUBE_INDICES: [u16; 36] = [
     1, 5, 6, 6, 2, 1, // +X
 ];
 
+/// A GPU buffer whose entire contents are replaced every time it's written
+/// (unlike `chunk_arena`'s multi-tenant allocator, there's nothing here
+/// worth preserving across writes), so growing it never needs to copy old
+/// data — it just recreates at the new size and the next `write` fills it.
+struct ScratchBuffer {
+    buffer: wgpu::Buffer,
+    label: &'static str,
+    usage: wgpu::BufferUsages,
+    capacity: u64,
+}
+
+impl ScratchBuffer {
+    fn new(device: &wgpu::Device, label: &'static str, usage: wgpu::BufferUsages) -> Self {
+        let capacity = 4096;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: capacity,
+            usage,
+            mapped_at_creation: false,
+        });
+        Self {
+            buffer,
+            label,
+            usage,
+            capacity,
+        }
+    }
+
+    /// Ensures the buffer is at least big enough for `data`, then uploads it.
+    fn write(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8]) {
+        let needed = data.len() as u64;
+        if needed > self.capacity {
+            self.capacity = needed.next_power_of_two();
+            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(self.label),
+                size: self.capacity,
+                usage: self.usage,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&self.buffer, 0, data);
+    }
+
+    fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+}
+
 /// A readback whose resolve/copy has been recorded but not yet submitted —
 /// `map_async` can only be called once that submission actually happens
 /// (see `begin_readback`), since a buffer can't be mapped for CPU reads
@@ -70,6 +117,10 @@ pub struct OcclusionCuller {
     query_set: wgpu::QuerySet,
     resolve_buffer: wgpu::Buffer,
     readback_buffers: [wgpu::Buffer; 2],
+    /// Box-proxy geometry rebuilt (but not reallocated) every call to
+    /// `record_queries` — was `create_buffer_init` from scratch every frame.
+    box_vertex_buffer: ScratchBuffer,
+    box_index_buffer: ScratchBuffer,
     /// Which of `readback_buffers` the *next* `record_queries` call should
     /// target, alternated independently of `pending` (which is always
     /// `None` by the time a new call is allowed — see
@@ -78,7 +129,7 @@ pub struct OcclusionCuller {
     next_buffer: usize,
     awaiting_submit: Option<AwaitingSubmit>,
     pending: Option<Pending>,
-    visible: HashMap<ChunkPos, bool>,
+    visible: FxHashMap<ChunkPos, bool>,
 }
 
 impl OcclusionCuller {
@@ -164,15 +215,28 @@ impl OcclusionCuller {
             })
         };
 
+        let box_vertex_buffer = ScratchBuffer::new(
+            device,
+            "occlusion box vertex buffer",
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        );
+        let box_index_buffer = ScratchBuffer::new(
+            device,
+            "occlusion box index buffer",
+            wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        );
+
         Self {
             pipeline,
             query_set,
             resolve_buffer,
             readback_buffers: [make_readback_buffer(), make_readback_buffer()],
+            box_vertex_buffer,
+            box_index_buffer,
             next_buffer: 0,
             awaiting_submit: None,
             pending: None,
-            visible: HashMap::new(),
+            visible: FxHashMap::default(),
         }
     }
 
@@ -263,6 +327,7 @@ impl OcclusionCuller {
     pub fn record_queries(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         depth_view: &wgpu::TextureView,
         camera_bind_group: &wgpu::BindGroup,
@@ -290,16 +355,18 @@ impl OcclusionCuller {
             indices.extend(CUBE_INDICES.iter().map(|&i| base + i as u32));
         }
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("occlusion box vertex buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("occlusion box index buffer"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(&vertices);
+        let index_bytes: &[u8] = bytemuck::cast_slice(&indices);
+        self.box_vertex_buffer.write(device, queue, vertex_bytes);
+        self.box_index_buffer.write(device, queue, index_bytes);
+        let vertex_buffer = self
+            .box_vertex_buffer
+            .buffer()
+            .slice(0..vertex_bytes.len() as u64);
+        let index_buffer = self
+            .box_index_buffer
+            .buffer()
+            .slice(0..index_bytes.len() as u64);
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -320,8 +387,8 @@ impl OcclusionCuller {
 
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, camera_bind_group, &[]);
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, vertex_buffer);
+            pass.set_index_buffer(index_buffer, wgpu::IndexFormat::Uint32);
 
             for i in 0..tested.len() as u32 {
                 let base = i * CUBE_INDICES.len() as u32;

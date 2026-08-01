@@ -1434,6 +1434,7 @@ dependencies = [
  "noise",
  "pollster",
  "rayon",
+ "rustc-hash 2.1.3",
  "wgpu",
  "winit",
 ]
